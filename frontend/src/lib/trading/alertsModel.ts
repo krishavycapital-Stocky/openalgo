@@ -24,6 +24,11 @@ import {
   utcSecondsToZonedParts,
   zonedWallClockToUtcSeconds,
 } from 'openalgo-charts'
+import {
+  type AdvancedAlertConfig,
+  registerAdvancedAlertCondition,
+  type SingleAlertCondition,
+} from './advancedAlerts'
 import { type AlertDelivery, DEFAULT_DELIVERY, deliveryOf } from './alertDelivery'
 import { snapTick } from './format'
 
@@ -78,7 +83,7 @@ export interface AlertDrawings {
   alertInfo(id: string): { available: boolean; levels: readonly { id: string; title: string }[] }
 }
 
-export type AlertKind = 'price' | 'indicator' | 'drawing' | 'barCondition'
+export type AlertKind = 'price' | 'indicator' | 'drawing' | 'barCondition' | 'advanced'
 
 export type AlertConditionId =
   | 'crossing'
@@ -123,6 +128,9 @@ export interface AlertDraft {
    * ten minutes do not deserve the same interruption.
    */
   deliver: AlertDelivery
+  /** TradingView-style multi-condition rules (Priority 2). */
+  advancedConditions?: SingleAlertCondition[]
+  advancedLogic?: 'and' | 'or'
 }
 
 /**
@@ -163,6 +171,7 @@ export const ALERT_KINDS: readonly { value: AlertKind; label: string }[] = [
   { value: 'indicator', label: 'Study plot' },
   { value: 'drawing', label: 'Drawing level' },
   { value: 'barCondition', label: 'Candle condition' },
+  { value: 'advanced', label: 'Multi-Condition (TradingView Style)' },
 ]
 
 /** The studies on the chart, numbered the way the legend numbers them. */
@@ -261,6 +270,33 @@ export function draftProblem(
   if (draft.kind === 'barCondition' && !draft.barConditionId) {
     return 'Choose a candle condition.'
   }
+  if (draft.kind === 'advanced') {
+    if (!draft.advancedConditions || draft.advancedConditions.length === 0) {
+      return 'Add at least one condition.'
+    }
+    if (draft.advancedConditions.length > 5) {
+      return 'An alert supports up to 5 conditions.'
+    }
+    for (let i = 0; i < draft.advancedConditions.length; i++) {
+      const c = draft.advancedConditions[i]!
+      if (c.left.type === 'indicator' && !c.left.indicator) {
+        return `Condition #${i + 1}: Select an indicator on the left.`
+      }
+      if (c.right.type === 'value') {
+        if (c.right.value === undefined || Number.isNaN(c.right.value)) {
+          return `Condition #${i + 1}: Enter a numeric threshold on the right.`
+        }
+        if (isRangeCondition(c.operator)) {
+          if (c.right.upperValue === undefined || Number.isNaN(c.right.upperValue)) {
+            return `Condition #${i + 1}: Channel conditions need both lower and upper bounds.`
+          }
+        }
+      }
+      if (c.right.type === 'indicator' && !c.right.indicator) {
+        return `Condition #${i + 1}: Select an indicator on the right.`
+      }
+    }
+  }
   const cooldown = Number(draft.cooldownSeconds)
   if (draft.cooldownSeconds.trim() !== '' && (!Number.isFinite(cooldown) || cooldown < 0)) {
     return 'A cooldown is a number of seconds, or nothing at all.'
@@ -332,6 +368,11 @@ export function titleFor(
   symbol: string,
   at?: AlertTick
 ): string {
+  if (draft.kind === 'advanced') {
+    const count = draft.advancedConditions?.length ?? 0
+    const logic = (draft.advancedLogic ?? 'and').toUpperCase()
+    return `${symbol} Multi-Condition (${count} condition${count === 1 ? '' : 's'}, ${logic})`
+  }
   return nameFrom(
     {
       kind: draft.kind,
@@ -432,6 +473,7 @@ export interface AlertPayload {
   /** A name we wrote and may rewrite when the price moves under a drag. */
   readonly autoTitle?: true
   readonly deliver?: AlertDelivery
+  readonly advancedConfig?: AdvancedAlertConfig
 }
 
 /**
@@ -472,8 +514,10 @@ export function draftFor(options: {
   readonly at?: AlertTick
 }): AlertDraft {
   const { chart, drawings: tier, zone, existing, at } = options
+  const existingPayload = existing?.payload as AlertPayload | undefined
+  const isAdvanced = existingPayload?.advancedConfig !== undefined
   const source = existing?.source ?? options.source
-  const kind = (source?.kind ?? 'price') as AlertKind
+  const kind = (isAdvanced ? 'advanced' : (source?.kind ?? 'price')) as AlertKind
   const studies = studyChoices(chart)
   const instanceId = source?.kind === 'indicator' ? source.instanceId : (studies[0]?.value ?? '')
   const plots = plotChoices(chart, instanceId)
@@ -533,6 +577,22 @@ export function draftFor(options: {
     // An alert stored before delivery was a choice reads as the default, which
     // is the behaviour it already had plus the sound.
     deliver: deliveryOf(existing?.payload),
+    advancedConditions:
+      isAdvanced && existingPayload?.advancedConfig?.conditions
+        ? [...existingPayload.advancedConfig.conditions]
+        : [
+            {
+              id: 'c_1',
+              timeframe: 'chart',
+              left: { type: 'price', source: 'close' },
+              operator: 'crossing',
+              right: {
+                type: 'value',
+                value: seeded === null || seeded === undefined ? 0 : Number(onTick(seeded)),
+              },
+            },
+          ],
+    advancedLogic: isAdvanced ? (existingPayload?.advancedConfig?.logic ?? 'and') : 'and',
   }
 }
 
@@ -551,6 +611,37 @@ export function toAlertInput(
   at?: AlertTick
 ): AlertInput | null {
   if (draftProblem(draft, chart, drawings) !== null) return null
+  const cooldown = Number(draft.cooldownSeconds)
+
+  if (draft.kind === 'advanced') {
+    const configId = `adv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+    const config: AdvancedAlertConfig = {
+      id: configId,
+      logic: draft.advancedLogic ?? 'and',
+      conditions: draft.advancedConditions ?? [],
+      triggerMode: draft.repeat === 'once' ? 'once' : 'everyTime',
+      cooldownSeconds: !Number.isFinite(cooldown) || cooldown < 0 ? 0 : cooldown,
+    }
+    const conditionId = registerAdvancedAlertCondition(config)
+    return {
+      source: { kind: 'barCondition', id: conditionId },
+      condition: 'crossing',
+      policy: draft.policy,
+      repeat: draft.repeat,
+      state: draft.enabled ? 'armed' : 'disabled',
+      title: draft.title.trim() || titleFor(draft, chart, symbol, at),
+      payload: {
+        ...(draft.title.trim() === '' ? AUTO_TITLE_PAYLOAD : {}),
+        deliver: draft.deliver ?? DEFAULT_DELIVERY,
+        advancedConfig: config,
+      } satisfies AlertPayload,
+      message: draft.message.trim() || undefined,
+      cooldownSeconds:
+        draft.cooldownSeconds.trim() === '' || !Number.isFinite(cooldown) ? 0 : cooldown,
+      expiresAt: expirySeconds(draft.expiresAt, chart.timezone()),
+    }
+  }
+
   const onTick = draft.kind === 'price'
   const value = onTick ? snapPrice(Number(draft.value), at) : Number(draft.value)
   const rawUpper = isRangeCondition(draft.condition) ? Number(draft.upperValue) : undefined
@@ -569,7 +660,6 @@ export function toAlertInput(
         : draft.kind === 'drawing'
           ? { kind: 'drawing', drawingId: draft.drawingId, level: draft.level }
           : { kind: 'barCondition', id: draft.barConditionId }
-  const cooldown = Number(draft.cooldownSeconds)
   return {
     source,
     condition: draft.condition,

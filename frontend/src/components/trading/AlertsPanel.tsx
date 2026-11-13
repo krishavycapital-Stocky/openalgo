@@ -32,7 +32,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import type { Alert } from 'openalgo-charts'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -40,6 +40,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { syncRegisteredAdvancedAlerts } from '@/lib/trading/advancedAlerts'
 import { alertSoundManager } from '@/lib/trading/alertSoundManager'
 import type { AlertFire, AlertsView } from '@/lib/trading/terminal'
 import { cn } from '@/lib/utils'
@@ -235,6 +236,10 @@ export function AlertsPanel({ view, log, paneLabel, onEdit, onClearLog, revision
   // nothing else tells React that a drag, a Delete key or a firing changed it.
   // biome-ignore lint/correctness/useExhaustiveDependencies: see above
   const alerts = useMemo(() => (view ? view.alerts.list() : []), [view, revision])
+
+  useEffect(() => {
+    syncRegisteredAdvancedAlerts(alerts)
+  }, [alerts])
 
   /**
    * Why each alert that cannot fire right now cannot fire, keyed by id.

@@ -548,4 +548,90 @@ describe('the draft a right-click and the form both start from', () => {
     expect(input?.source).toMatchObject({ kind: 'price', price: 1293.65 })
     expect(input?.title).toBe('RELIANCE crossing 1293.65')
   })
+
+  it('builds a multi-condition alert input with registered barCondition source and payload config', () => {
+    const multiDraft = draft({
+      kind: 'advanced',
+      advancedLogic: 'and',
+      advancedConditions: [
+        {
+          id: 'c1',
+          timeframe: '1m',
+          left: { type: 'indicator', indicator: 'ema', period: 9 },
+          operator: 'crossingUp',
+          right: { type: 'indicator', indicator: 'ema', period: 21 },
+        },
+        {
+          id: 'c2',
+          timeframe: '5m',
+          left: { type: 'indicator', indicator: 'rsi', period: 14 },
+          operator: 'greaterThan',
+          right: { type: 'value', value: 60 },
+        },
+      ],
+    })
+
+    const input = toAlertInput(multiDraft, chart(), drawings, 'NIFTY')
+    expect(input).not.toBeNull()
+    expect(input?.source.kind).toBe('barCondition')
+    expect(input?.source).toHaveProperty('id')
+    expect(input?.title).toBe('NIFTY Multi-Condition (2 conditions, AND)')
+    expect((input?.payload as { advancedConfig?: unknown })?.advancedConfig).toBeDefined()
+  })
+
+  it('validates multi-condition rules (rejects more than 5 conditions)', () => {
+    const conditions = Array.from({ length: 6 }, (_, i) => ({
+      id: `c_${i}`,
+      timeframe: 'chart',
+      left: { type: 'price' as const, source: 'close' as const },
+      operator: 'greaterThan' as const,
+      right: { type: 'value' as const, value: 100 },
+    }))
+
+    const invalid = draft({
+      kind: 'advanced',
+      advancedConditions: conditions,
+    })
+    expect(draftProblem(invalid, chart(), drawings)).toBe('An alert supports up to 5 conditions.')
+  })
+
+  it('restores multi-condition configuration when editing an existing alert', () => {
+    const existingAlert = {
+      id: 'existing_adv',
+      source: { kind: 'barCondition', id: 'adv_alert_123' },
+      condition: 'crossing',
+      policy: 'onBarClose',
+      repeat: 'everyTime',
+      state: 'armed',
+      title: 'Custom Multi Alert',
+      payload: {
+        advancedConfig: {
+          id: '123',
+          logic: 'or',
+          conditions: [
+            {
+              id: 'cond_a',
+              timeframe: '15m',
+              left: { type: 'price', source: 'close' },
+              operator: 'greaterThan',
+              right: { type: 'value', value: 2500 },
+            },
+          ],
+        },
+      },
+    }
+
+    const restored = draftFor({
+      chart: chart(),
+      drawings,
+      zone,
+      at,
+      existing: existingAlert as never,
+    })
+
+    expect(restored.kind).toBe('advanced')
+    expect(restored.advancedLogic).toBe('or')
+    expect(restored.advancedConditions?.length).toBe(1)
+    expect(restored.advancedConditions?.[0]?.timeframe).toBe('15m')
+  })
 })

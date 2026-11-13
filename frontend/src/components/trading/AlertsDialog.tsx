@@ -73,6 +73,7 @@ import {
 } from '@/lib/trading/alertsModel'
 import type { AlertsHandle } from '@/lib/trading/terminal'
 import { cn } from '@/lib/utils'
+import { MultiConditionEditor } from './MultiConditionEditor'
 
 /** A section heading. The four of them are what makes this read as a sentence. */
 function Section({ children }: { children: React.ReactNode }) {
@@ -225,7 +226,12 @@ export function AlertsDialog({ handle, onClose }: Props) {
 
   return (
     <Dialog open={handle !== null} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-h-[88dvh] overflow-y-auto sm:max-w-md">
+      <DialogContent
+        className={cn(
+          'max-h-[88dvh] overflow-y-auto',
+          draft?.kind === 'advanced' ? 'sm:max-w-xl' : 'sm:max-w-md'
+        )}
+      >
         <DialogHeader>
           <DialogTitle className="text-base">{editing ? 'Edit alert' : 'Create alert'}</DialogTitle>
           <DialogDescription className="text-xs">
@@ -266,84 +272,101 @@ export function AlertsDialog({ handle, onClose }: Props) {
                   })
                 }}
               />
-              {draft.kind === 'indicator' && (
+              {draft.kind === 'advanced' ? (
+                <MultiConditionEditor
+                  conditions={draft.advancedConditions ?? []}
+                  logic={draft.advancedLogic ?? 'and'}
+                  onChange={(advancedConditions, advancedLogic) =>
+                    patch({ advancedConditions, advancedLogic })
+                  }
+                />
+              ) : (
                 <>
-                  <Choice
-                    label="Study"
-                    value={draft.instanceId}
-                    options={studies}
-                    onChange={(instanceId) => {
-                      const next = handle ? plotChoices(handle.chart, instanceId) : []
-                      const plotKey = next[0]?.value ?? ''
-                      const seeded = handle ? plotValueAt(handle.chart, instanceId, plotKey) : null
-                      patch({
-                        instanceId,
-                        plotKey,
-                        value: seeded === null ? draft.value : String(seeded),
-                      })
-                    }}
-                  />
-                  <Choice
-                    label="Plot"
-                    value={draft.plotKey}
-                    options={plots}
-                    onChange={(plotKey) => {
-                      const seeded = handle
-                        ? plotValueAt(handle.chart, draft.instanceId, plotKey)
-                        : null
-                      patch({ plotKey, value: seeded === null ? draft.value : String(seeded) })
-                    }}
-                  />
-                </>
-              )}
-              {draft.kind === 'drawing' && (
-                <>
-                  <Choice
-                    label="Drawing"
-                    value={draft.drawingId}
-                    options={drawings}
-                    onChange={(drawingId) => {
-                      const next = levelChoices(handle?.drawings ?? null, drawingId)
-                      patch({ drawingId, level: next[0]?.value ?? '' })
-                    }}
-                  />
-                  <Choice
-                    label="Level"
-                    value={draft.level}
-                    options={levels}
-                    onChange={(level) => patch({ level })}
-                  />
-                </>
-              )}
-              <Choice
-                label="Condition"
-                value={draft.condition}
-                options={ALERT_CONDITIONS}
-                onChange={(condition) => patch({ condition: condition as AlertConditionId })}
-              />
-              {needsThreshold(draft.kind) && (
-                <div
-                  className={cn('grid gap-2', isRangeCondition(draft.condition) && 'grid-cols-2')}
-                >
-                  <Input
-                    inputMode="decimal"
-                    value={draft.value}
-                    onChange={(event) => patch({ value: event.target.value })}
-                    aria-label={isRangeCondition(draft.condition) ? 'Lower bound' : 'Value'}
-                    placeholder={isRangeCondition(draft.condition) ? 'Lower' : 'Value'}
-                    className="h-9 text-sm"
-                  />
-                  {isRangeCondition(draft.condition) && (
-                    <Input
-                      inputMode="decimal"
-                      value={draft.upperValue}
-                      onChange={(event) => patch({ upperValue: event.target.value })}
-                      aria-label="Upper bound"
-                      placeholder="Upper"
-                      className="h-9 text-sm"
-                    />
+                  {draft.kind === 'indicator' && (
+                    <>
+                      <Choice
+                        label="Study"
+                        value={draft.instanceId}
+                        options={studies}
+                        onChange={(instanceId) => {
+                          const next = handle ? plotChoices(handle.chart, instanceId) : []
+                          const plotKey = next[0]?.value ?? ''
+                          const seeded = handle
+                            ? plotValueAt(handle.chart, instanceId, plotKey)
+                            : null
+                          patch({
+                            instanceId,
+                            plotKey,
+                            value: seeded === null ? draft.value : String(seeded),
+                          })
+                        }}
+                      />
+                      <Choice
+                        label="Plot"
+                        value={draft.plotKey}
+                        options={plots}
+                        onChange={(plotKey) => {
+                          const seeded = handle
+                            ? plotValueAt(handle.chart, draft.instanceId, plotKey)
+                            : null
+                          patch({ plotKey, value: seeded === null ? draft.value : String(seeded) })
+                        }}
+                      />
+                    </>
                   )}
-                </div>
+                  {draft.kind === 'drawing' && (
+                    <>
+                      <Choice
+                        label="Drawing"
+                        value={draft.drawingId}
+                        options={drawings}
+                        onChange={(drawingId) => {
+                          const next = levelChoices(handle?.drawings ?? null, drawingId)
+                          patch({ drawingId, level: next[0]?.value ?? '' })
+                        }}
+                      />
+                      <Choice
+                        label="Level"
+                        value={draft.level}
+                        options={levels}
+                        onChange={(level) => patch({ level })}
+                      />
+                    </>
+                  )}
+                  <Choice
+                    label="Condition"
+                    value={draft.condition}
+                    options={ALERT_CONDITIONS}
+                    onChange={(condition) => patch({ condition: condition as AlertConditionId })}
+                  />
+                  {needsThreshold(draft.kind) && (
+                    <div
+                      className={cn(
+                        'grid gap-2',
+                        isRangeCondition(draft.condition) && 'grid-cols-2'
+                      )}
+                    >
+                      <Input
+                        inputMode="decimal"
+                        value={draft.value}
+                        onChange={(event) => patch({ value: event.target.value })}
+                        aria-label={isRangeCondition(draft.condition) ? 'Lower bound' : 'Value'}
+                        placeholder={isRangeCondition(draft.condition) ? 'Lower' : 'Value'}
+                        className="h-9 text-sm"
+                      />
+                      {isRangeCondition(draft.condition) && (
+                        <Input
+                          inputMode="decimal"
+                          value={draft.upperValue}
+                          onChange={(event) => patch({ upperValue: event.target.value })}
+                          aria-label="Upper bound"
+                          placeholder="Upper"
+                          className="h-9 text-sm"
+                        />
+                      )}
+                    </div>
+                  )}
+                </>
               )}
             </div>
 
@@ -369,6 +392,20 @@ export function AlertsDialog({ handle, onClose }: Props) {
                     { value: 'onTouch', label: 'Intrabar touch' },
                   ]}
                   onChange={(policy) => patch({ policy: policy as AlertDraft['policy'] })}
+                />
+              </div>
+              <div className="flex items-center gap-2 pt-1">
+                <span className="text-xs text-muted-foreground whitespace-nowrap">
+                  Cooldown (seconds):
+                </span>
+                <Input
+                  type="number"
+                  min={0}
+                  step={10}
+                  value={draft.cooldownSeconds}
+                  onChange={(e) => patch({ cooldownSeconds: e.target.value })}
+                  placeholder="0 (no cooldown)"
+                  className="h-7 w-28 text-xs"
                 />
               </div>
               <p className="text-[11px] leading-snug text-muted-foreground">
