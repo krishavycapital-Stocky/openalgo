@@ -693,7 +693,13 @@ const registeredConditions = new Map<string, AdvancedAlertConfig>()
  */
 export function registerAdvancedAlertCondition(config: AdvancedAlertConfig): string {
   const conditionId = `adv_alert_${config.id}`
-  registeredConditions.set(conditionId, config)
+  // Alert restoration may run more than once (for example during React remounts).
+  // Keep the registered callback and refresh its configuration without registering
+  // the same ID a second time in openalgo-charts.
+  if (registeredConditions.has(conditionId)) {
+    registeredConditions.set(conditionId, config)
+    return conditionId
+  }
 
   const barCondition: BarCondition = {
     id: conditionId,
@@ -706,6 +712,7 @@ export function registerAdvancedAlertCondition(config: AdvancedAlertConfig): str
   }
 
   registerBarCondition(barCondition)
+  registeredConditions.set(conditionId, config)
   return conditionId
 }
 
