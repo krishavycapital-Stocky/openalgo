@@ -625,7 +625,7 @@ export function toAlertInput(
     const conditionId = registerAdvancedAlertCondition(config)
     return {
       source: { kind: 'barCondition', id: conditionId },
-      condition: 'crossing',
+      condition: 'matches',
       policy: draft.policy,
       repeat: draft.repeat,
       state: draft.enabled ? 'armed' : 'disabled',
