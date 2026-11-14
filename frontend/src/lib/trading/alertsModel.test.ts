@@ -595,6 +595,50 @@ describe('the draft a right-click and the form both start from', () => {
     expect(draftProblem(invalid, chart(), drawings)).toBe('An alert supports up to 5 conditions.')
   })
 
+  it('validates multi-condition rules (rejects empty conditions list)', () => {
+    const invalid = draft({
+      kind: 'advanced',
+      advancedConditions: [],
+    })
+    expect(draftProblem(invalid, chart(), drawings)).toBe('Add at least one condition.')
+  })
+
+  it('validates multi-condition rules (rejects indicator left operand with no indicator selected)', () => {
+    const invalid = draft({
+      kind: 'advanced',
+      advancedConditions: [
+        {
+          id: 'c1',
+          timeframe: 'chart',
+          left: { type: 'indicator' as const, indicator: undefined },
+          operator: 'greaterThan' as const,
+          right: { type: 'value' as const, value: 100 },
+        },
+      ],
+    })
+    expect(draftProblem(invalid, chart(), drawings)).toBe(
+      'Condition #1: Select an indicator on the left.'
+    )
+  })
+
+  it('validates multi-condition rules (rejects indicator right operand with no indicator selected)', () => {
+    const invalid = draft({
+      kind: 'advanced',
+      advancedConditions: [
+        {
+          id: 'c1',
+          timeframe: 'chart',
+          left: { type: 'price' as const, source: 'close' as const },
+          operator: 'greaterThan' as const,
+          right: { type: 'indicator' as const, indicator: undefined },
+        },
+      ],
+    })
+    expect(draftProblem(invalid, chart(), drawings)).toBe(
+      'Condition #1: Select an indicator on the right.'
+    )
+  })
+
   it('restores multi-condition configuration when editing an existing alert', () => {
     const existingAlert = {
       id: 'existing_adv',

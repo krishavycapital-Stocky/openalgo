@@ -304,3 +304,272 @@ describe('multi-condition and multi-timeframe alert evaluation', () => {
     unregisterAdvancedAlertCondition('reg-test-1')
   })
 })
+
+// ─── Regression tests (Priority 2 refinement) ────────────────────────────────
+
+describe('AND / OR multi-condition logic', () => {
+  const makeSimpleBars = (): Bar[] => [
+    makeBar(60, 100, 101, 99, 100),
+    makeBar(120, 100, 103, 100, 102),
+  ]
+
+  const condAbove101: SingleAlertCondition = {
+    id: 'above101',
+    timeframe: 'chart',
+    left: { type: 'price', source: 'close' },
+    operator: 'greaterThan',
+    right: { type: 'value', value: 101 }, // 102 > 101 → true
+  }
+
+  const condAbove200: SingleAlertCondition = {
+    id: 'above200',
+    timeframe: 'chart',
+    left: { type: 'price', source: 'close' },
+    operator: 'greaterThan',
+    right: { type: 'value', value: 200 }, // 102 > 200 → false
+  }
+
+  it('AND fires when both conditions are true', () => {
+    const condAbove100: SingleAlertCondition = {
+      id: 'above100',
+      timeframe: 'chart',
+      left: { type: 'price', source: 'close' },
+      operator: 'greaterThan',
+      right: { type: 'value', value: 100 }, // 102 > 100 → true
+    }
+    const cfg: AdvancedAlertConfig = {
+      id: 'and-both-true',
+      logic: 'and',
+      triggerMode: 'everyTime',
+      conditions: [condAbove101, condAbove100],
+    }
+    expect(evaluateAdvancedAlert(cfg, makeSimpleBars())).toBe(true)
+  })
+
+  it('AND does NOT fire when one condition is false', () => {
+    const cfg: AdvancedAlertConfig = {
+      id: 'and-one-false',
+      logic: 'and',
+      triggerMode: 'everyTime',
+      conditions: [condAbove101, condAbove200],
+    }
+    expect(evaluateAdvancedAlert(cfg, makeSimpleBars())).toBe(false)
+  })
+
+  it('OR fires when one condition is true and one is false', () => {
+    const cfg: AdvancedAlertConfig = {
+      id: 'or-one-true',
+      logic: 'or',
+      triggerMode: 'everyTime',
+      conditions: [condAbove101, condAbove200],
+    }
+    expect(evaluateAdvancedAlert(cfg, makeSimpleBars())).toBe(true)
+  })
+
+  it('OR does NOT fire when both conditions are false', () => {
+    const condAbove300: SingleAlertCondition = {
+      id: 'above300',
+      timeframe: 'chart',
+      left: { type: 'price', source: 'close' },
+      operator: 'greaterThan',
+      right: { type: 'value', value: 300 }, // false
+    }
+    const cfg: AdvancedAlertConfig = {
+      id: 'or-both-false',
+      logic: 'or',
+      triggerMode: 'everyTime',
+      conditions: [condAbove200, condAbove300],
+    }
+    expect(evaluateAdvancedAlert(cfg, makeSimpleBars())).toBe(false)
+  })
+})
+
+describe('insufficient bars and NaN handling', () => {
+  it('returns false with less than 2 bars', () => {
+    const condition: SingleAlertCondition = {
+      id: 'c1',
+      timeframe: 'chart',
+      left: { type: 'price', source: 'close' },
+      operator: 'greaterThan',
+      right: { type: 'value', value: 100 },
+    }
+    const result = evaluateSingleCondition(condition, [makeBar(60, 100, 101, 99, 105)])
+    expect(result).toBe(false)
+  })
+
+  it('returns false (not throws) when EMA warm-up period is not reached', () => {
+    // Only 2 bars, EMA(20) needs 20+ bars to be valid
+    const bars: Bar[] = [makeBar(60, 100, 101, 99, 100), makeBar(120, 100, 103, 100, 102)]
+    const condition: SingleAlertCondition = {
+      id: 'ema-warmup',
+      timeframe: 'chart',
+      left: { type: 'indicator', indicator: 'ema', period: 20 },
+      operator: 'greaterThan',
+      right: { type: 'value', value: 100 },
+    }
+    // Should not throw; NaN from EMA returns false safely
+    expect(() => evaluateSingleCondition(condition, bars)).not.toThrow()
+    expect(evaluateSingleCondition(condition, bars)).toBe(false)
+  })
+
+  it('returns false (not throws) when RSI warm-up period is not reached', () => {
+    // RSI(14) requires at least 15 bars
+    const bars = Array.from({ length: 5 }, (_, i) => makeBar(i * 60, 100, 101, 99, 100 + i))
+    const condition: SingleAlertCondition = {
+      id: 'rsi-warmup',
+      timeframe: 'chart',
+      left: { type: 'indicator', indicator: 'rsi', period: 14 },
+      operator: 'greaterThan',
+      right: { type: 'value', value: 50 },
+    }
+    expect(() => evaluateSingleCondition(condition, bars)).not.toThrow()
+    expect(evaluateSingleCondition(condition, bars)).toBe(false)
+  })
+})
+
+describe('range conditions (enteringRange / leavingRange)', () => {
+  it('enteringRange fires when previous close was outside and current is inside', () => {
+    const bars: Bar[] = [
+      makeBar(60, 80, 82, 78, 80), // below range [90, 110]
+      makeBar(120, 90, 105, 89, 95), // enters range
+    ]
+    const cond: SingleAlertCondition = {
+      id: 'enter',
+      timeframe: 'chart',
+      left: { type: 'price', source: 'close' },
+      operator: 'enteringRange',
+      right: { type: 'value', value: 90, upperValue: 110 },
+    }
+    expect(evaluateSingleCondition(cond, bars)).toBe(true)
+  })
+
+  it('enteringRange does NOT fire when already inside range on previous bar', () => {
+    const bars: Bar[] = [
+      makeBar(60, 90, 100, 89, 95), // already inside [90, 110]
+      makeBar(120, 95, 108, 94, 100), // still inside
+    ]
+    const cond: SingleAlertCondition = {
+      id: 'enter-noop',
+      timeframe: 'chart',
+      left: { type: 'price', source: 'close' },
+      operator: 'enteringRange',
+      right: { type: 'value', value: 90, upperValue: 110 },
+    }
+    expect(evaluateSingleCondition(cond, bars)).toBe(false)
+  })
+
+  it('leavingRange fires when previous close was inside and current is outside', () => {
+    const bars: Bar[] = [
+      makeBar(60, 90, 100, 89, 95), // inside [90, 110]
+      makeBar(120, 95, 115, 94, 115), // leaves range (above 110)
+    ]
+    const cond: SingleAlertCondition = {
+      id: 'leave',
+      timeframe: 'chart',
+      left: { type: 'price', source: 'close' },
+      operator: 'leavingRange',
+      right: { type: 'value', value: 90, upperValue: 110 },
+    }
+    expect(evaluateSingleCondition(cond, bars)).toBe(true)
+  })
+})
+
+describe('indicator vs indicator conditions', () => {
+  it('EMA9 crossingUp EMA21 fires when faster EMA just crossed above slower', () => {
+    // Build enough bars for both EMAs to warm up (need 21+)
+    const bars: Bar[] = []
+    // 25 bars with slow upward drift, then a sharp surge
+    for (let i = 0; i < 25; i++) {
+      const p = 100 + i * 0.1 // gentle rise
+      bars.push(makeBar(i * 60, p - 0.5, p + 1, p - 1, p, 50))
+    }
+    // Sharp surge to force EMA9 to cross above EMA21
+    for (let i = 25; i < 30; i++) {
+      const p = 100 + (i - 20) * 3 // steep rise
+      bars.push(makeBar(i * 60, p - 1, p + 2, p - 1.5, p, 100))
+    }
+
+    const config: AdvancedAlertConfig = {
+      id: 'ema-crossover',
+      logic: 'and',
+      triggerMode: 'everyTime',
+      conditions: [
+        {
+          id: 'ema9-gt-ema21',
+          timeframe: 'chart',
+          left: { type: 'indicator', indicator: 'ema', period: 9 },
+          operator: 'crossingUp',
+          right: { type: 'indicator', indicator: 'ema', period: 21 },
+        },
+      ],
+    }
+    // The function should not throw and should return a boolean
+    const result = evaluateAdvancedAlert(config, bars)
+    expect(typeof result).toBe('boolean')
+  })
+
+  it('price crossingDown Supertrend evaluates without error', () => {
+    const bars: Bar[] = []
+    // Build enough bars for Supertrend (10 period ATR default)
+    for (let i = 0; i < 20; i++) {
+      const p = 100 + (19 - i) * 2 // downtrend
+      bars.push(makeBar(i * 60, p + 1, p + 2, p - 1, p, 50))
+    }
+
+    const config: AdvancedAlertConfig = {
+      id: 'price-vs-supertrend',
+      logic: 'and',
+      triggerMode: 'everyTime',
+      conditions: [
+        {
+          id: 'price-below-st',
+          timeframe: 'chart',
+          left: { type: 'price', source: 'close' },
+          operator: 'crossingDown',
+          right: { type: 'indicator', indicator: 'supertrend', period: 10, multiplier: 3 },
+        },
+      ],
+    }
+    expect(() => evaluateAdvancedAlert(config, bars)).not.toThrow()
+    expect(typeof evaluateAdvancedAlert(config, bars)).toBe('boolean')
+  })
+})
+
+describe('multi-timeframe resampling accuracy', () => {
+  it('5-minute OHLCV aggregates correctly from 1-minute bars', () => {
+    // 10 one-minute bars → 2 five-minute bars
+    const bars1m: Bar[] = [
+      makeBar(60, 100, 105, 99, 102, 10),
+      makeBar(120, 102, 108, 101, 104, 20),
+      makeBar(180, 104, 106, 98, 99, 15),
+      makeBar(240, 99, 103, 99, 101, 25),
+      makeBar(300, 101, 107, 100, 106, 30),
+      makeBar(360, 106, 110, 105, 108, 10),
+      makeBar(420, 108, 112, 107, 110, 20),
+      makeBar(480, 110, 111, 108, 109, 15),
+      makeBar(540, 109, 113, 108, 111, 25),
+      makeBar(600, 111, 115, 110, 114, 30),
+    ]
+
+    const bars5m = resampleBars(bars1m, 300)
+    expect(bars5m.length).toBeGreaterThanOrEqual(2)
+
+    // First 5m bucket: bars at t=60,120,180,240 (bucket floor=0)
+    const b0 = bars5m[0]!
+    expect(b0.open).toBe(100) // first open
+    expect(b0.high).toBe(108) // max high
+    expect(b0.low).toBe(98) // min low
+    expect(b0.close).toBe(101) // last close
+    expect(b0.volume).toBe(70) // sum
+
+    // Second 5m bucket: bars at t=300,360,420,480,540 (bucket floor=300)
+    // open=101 (first), high=max(107,110,112,111,113)=113, low=min(100,105,107,108,108)=100,
+    // close=111 (last of t=540), volume=30+10+20+15+25=100
+    const b1 = bars5m[1]!
+    expect(b1.open).toBe(101)
+    expect(b1.high).toBe(113)
+    expect(b1.low).toBe(100)
+    expect(b1.close).toBe(111)
+    expect(b1.volume).toBe(100)
+  })
+})

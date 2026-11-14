@@ -171,7 +171,7 @@ export const ALERT_KINDS: readonly { value: AlertKind; label: string }[] = [
   { value: 'indicator', label: 'Study plot' },
   { value: 'drawing', label: 'Drawing level' },
   { value: 'barCondition', label: 'Candle condition' },
-  { value: 'advanced', label: 'Multi-Condition (TradingView Style)' },
+  { value: 'advanced', label: 'Multi-Condition Alert' },
 ]
 
 /** The studies on the chart, numbered the way the legend numbers them. */
