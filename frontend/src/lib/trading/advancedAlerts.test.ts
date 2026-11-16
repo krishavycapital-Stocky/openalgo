@@ -10,9 +10,12 @@ import {
   calculateSupertrend,
   evaluateAdvancedAlert,
   evaluateSingleCondition,
+  formatPrecedenceExpression,
+  getRegisteredAdvancedAlert,
   registerAdvancedAlertCondition,
   resampleBars,
   type SingleAlertCondition,
+  syncRegisteredAdvancedAlerts,
   unregisterAdvancedAlertCondition,
 } from './advancedAlerts'
 
@@ -300,8 +303,58 @@ describe('multi-condition and multi-timeframe alert evaluation', () => {
 
     const condId = registerAdvancedAlertCondition(config)
     expect(condId).toBe('adv_alert_reg-test-1')
+    expect(getRegisteredAdvancedAlert('reg-test-1')).toEqual(config)
 
     unregisterAdvancedAlertCondition('reg-test-1')
+    expect(getRegisteredAdvancedAlert('reg-test-1')).toBeUndefined()
+  })
+
+  it('syncRegisteredAdvancedAlerts registers active alerts and unregisters deleted ones', () => {
+    const configA: AdvancedAlertConfig = {
+      id: 'sync-a',
+      logic: 'and',
+      triggerMode: 'everyTime',
+      conditions: [
+        {
+          id: 'c1',
+          timeframe: 'chart',
+          left: { type: 'price', source: 'close' },
+          operator: 'greaterThan',
+          right: { type: 'value', value: 100 },
+        },
+      ],
+    }
+    const configB: AdvancedAlertConfig = {
+      id: 'sync-b',
+      logic: 'or',
+      triggerMode: 'once',
+      conditions: [
+        {
+          id: 'c2',
+          timeframe: 'chart',
+          left: { type: 'price', source: 'close' },
+          operator: 'lessThan',
+          right: { type: 'value', value: 50 },
+        },
+      ],
+    }
+
+    // Sync with both alerts
+    syncRegisteredAdvancedAlerts([
+      { payload: { advancedConfig: configA } },
+      { payload: { advancedConfig: configB } },
+    ])
+    expect(getRegisteredAdvancedAlert('sync-a')).toBeDefined()
+    expect(getRegisteredAdvancedAlert('sync-b')).toBeDefined()
+
+    // Sync with only alert A remaining (alert B was deleted)
+    syncRegisteredAdvancedAlerts([{ payload: { advancedConfig: configA } }])
+    expect(getRegisteredAdvancedAlert('sync-a')).toBeDefined()
+    expect(getRegisteredAdvancedAlert('sync-b')).toBeUndefined()
+
+    // Clean up
+    syncRegisteredAdvancedAlerts([])
+    expect(getRegisteredAdvancedAlert('sync-a')).toBeUndefined()
   })
 })
 
@@ -571,5 +624,664 @@ describe('multi-timeframe resampling accuracy', () => {
     expect(b1.low).toBe(100)
     expect(b1.close).toBe(111)
     expect(b1.volume).toBe(100)
+  })
+})
+
+describe('volume and open interest alert evaluation', () => {
+  const makeOiBar = (time: number, close: number, volume?: number, oi?: number): Bar => ({
+    time,
+    open: close,
+    high: close + 1,
+    low: close - 1,
+    close,
+    ...(volume !== undefined ? { volume } : {}),
+    ...(oi !== undefined ? { oi } : {}),
+  })
+
+  it('triggers volume crossing threshold', () => {
+    const bars: Bar[] = [makeOiBar(60, 100, 4000), makeOiBar(120, 101, 8000)]
+
+    const config: AdvancedAlertConfig = {
+      id: 'vol-cross',
+      logic: 'and',
+      triggerMode: 'everyTime',
+      conditions: [
+        {
+          id: 'vol-above-5k',
+          timeframe: 'chart',
+          left: { type: 'volume' },
+          operator: 'crossingUp',
+          right: { type: 'value', value: 5000 },
+        },
+      ],
+    }
+
+    expect(evaluateAdvancedAlert(config, bars)).toBe(true)
+  })
+
+  it('triggers open interest crossing threshold on derivative contract', () => {
+    const bars: Bar[] = [makeOiBar(60, 24000, 1000, 45000), makeOiBar(120, 24050, 1500, 55000)]
+
+    const config: AdvancedAlertConfig = {
+      id: 'oi-cross',
+      logic: 'and',
+      triggerMode: 'everyTime',
+      conditions: [
+        {
+          id: 'oi-above-50k',
+          timeframe: 'chart',
+          left: { type: 'openInterest' },
+          operator: 'crossingUp',
+          right: { type: 'value', value: 50000 },
+        },
+      ],
+    }
+
+    expect(evaluateAdvancedAlert(config, bars)).toBe(true)
+  })
+
+  it('evaluates volume crossing volume SMA accurately', () => {
+    // 5 bars of volume: 100, 100, 100, 100, 500
+    // SMA(3) at bar 4 = (100+100+100)/3 = 100. Previous vol 100 <= 100.
+    // SMA(3) at bar 5 = (100+100+500)/3 = 233.33. Current vol 500 > 233.33.
+    const bars: Bar[] = [
+      makeOiBar(60, 100, 100),
+      makeOiBar(120, 100, 100),
+      makeOiBar(180, 100, 100),
+      makeOiBar(240, 100, 100),
+      makeOiBar(300, 100, 500),
+    ]
+
+    const config: AdvancedAlertConfig = {
+      id: 'vol-cross-sma',
+      logic: 'and',
+      triggerMode: 'everyTime',
+      conditions: [
+        {
+          id: 'vol-above-sma',
+          timeframe: 'chart',
+          left: { type: 'volume' },
+          operator: 'crossingUp',
+          right: { type: 'volume', indicator: 'sma', period: 3 },
+        },
+      ],
+    }
+
+    expect(evaluateAdvancedAlert(config, bars)).toBe(true)
+  })
+
+  it('never substitutes missing OI with zero and refuses to fire false alerts', () => {
+    // Bar without OI (e.g. cash equity or missing feed data)
+    const barsNoOi: Bar[] = [
+      makeOiBar(60, 100, 1000), // oi undefined
+      makeOiBar(120, 101, 1200), // oi undefined
+    ]
+
+    const config: AdvancedAlertConfig = {
+      id: 'oi-missing',
+      logic: 'and',
+      triggerMode: 'everyTime',
+      conditions: [
+        {
+          id: 'oi-greater-than-zero',
+          timeframe: 'chart',
+          left: { type: 'openInterest' },
+          operator: 'greaterThan',
+          right: { type: 'value', value: 0 },
+        },
+      ],
+    }
+
+    // Must evaluate to false, NOT treat undefined as 0 or trigger false comparison
+    expect(evaluateAdvancedAlert(config, barsNoOi)).toBe(false)
+  })
+
+  it('resamples open interest as latest point-in-time level and volume as cumulative sum', () => {
+    const bars1m: Bar[] = [
+      makeOiBar(60, 100, 10, 1000),
+      makeOiBar(120, 102, 20, 1200),
+      makeOiBar(180, 104, 15, 1100),
+      makeOiBar(240, 99, 25, 1500),
+    ]
+
+    const resampled = resampleBars(bars1m, 300)
+    expect(resampled.length).toBe(1)
+    const b0 = resampled[0]!
+    expect(b0.volume).toBe(70) // 10 + 20 + 15 + 25
+    expect(b0.oi).toBe(1500) // latest bar's OI level, NOT summed 4800!
+  })
+})
+
+describe('mixed AND/OR grouping across up to five conditions', () => {
+  const bars: Bar[] = [makeBar(60, 100, 105, 95, 100, 100), makeBar(120, 100, 110, 99, 108, 500)]
+
+  const condPriceAbove105: SingleAlertCondition = {
+    id: 'c1',
+    timeframe: 'chart',
+    left: { type: 'price', source: 'close' },
+    operator: 'greaterThan',
+    right: { type: 'value', value: 105 },
+    groupId: 'g1',
+  }
+
+  const condPriceBelow50: SingleAlertCondition = {
+    id: 'c2',
+    timeframe: 'chart',
+    left: { type: 'price', source: 'close' },
+    operator: 'lessThan',
+    right: { type: 'value', value: 50 }, // FALSE
+    groupId: 'g1',
+  }
+
+  const condVolAbove300: SingleAlertCondition = {
+    id: 'c3',
+    timeframe: 'chart',
+    left: { type: 'volume' },
+    operator: 'greaterThan',
+    right: { type: 'value', value: 300 }, // TRUE
+    groupId: 'g2',
+  }
+
+  const condVolAbove1000: SingleAlertCondition = {
+    id: 'c4',
+    timeframe: 'chart',
+    left: { type: 'volume' },
+    operator: 'greaterThan',
+    right: { type: 'value', value: 1000 }, // FALSE
+    groupId: 'g2',
+  }
+
+  it('evaluates (C1 AND C2) OR C3 where C1=T, C2=F, C3=T -> TRUE', () => {
+    const config: AdvancedAlertConfig = {
+      id: 'mixed-1',
+      logic: 'or', // Connect groups with OR
+      groups: [
+        { id: 'g1', logic: 'and' }, // C1 AND C2 -> T and F = F
+        { id: 'g2', logic: 'or' }, // C3 -> T
+      ],
+      triggerMode: 'everyTime',
+      conditions: [condPriceAbove105, condPriceBelow50, condVolAbove300],
+    }
+
+    expect(evaluateAdvancedAlert(config, bars)).toBe(true)
+  })
+
+  it('evaluates (C1 OR C2) AND (C3 AND C4) where C1=T, C2=F, C3=T, C4=F -> FALSE', () => {
+    const config: AdvancedAlertConfig = {
+      id: 'mixed-2',
+      logic: 'and', // Connect groups with AND
+      groups: [
+        { id: 'g1', logic: 'or' }, // C1 OR C2 -> T or F = T
+        { id: 'g2', logic: 'and' }, // C3 AND C4 -> T and F = F
+      ],
+      triggerMode: 'everyTime',
+      conditions: [condPriceAbove105, condPriceBelow50, condVolAbove300, condVolAbove1000],
+    }
+
+    expect(evaluateAdvancedAlert(config, bars)).toBe(false)
+  })
+
+  it('evaluates complex 5-condition grouped expression accurately', () => {
+    const cond5: SingleAlertCondition = {
+      id: 'c5',
+      timeframe: 'chart',
+      left: { type: 'price', source: 'high' },
+      operator: 'greaterThan',
+      right: { type: 'value', value: 109 }, // TRUE (high=110)
+      groupId: 'g2',
+    }
+
+    // Group 1 (AND): C1(T) and C2(F) -> F
+    // Group 2 (AND): C3(T) and C5(T) -> T
+    // Top: OR -> F or T = TRUE
+    const config: AdvancedAlertConfig = {
+      id: 'mixed-5cond',
+      logic: 'or',
+      groups: [
+        { id: 'g1', logic: 'and' },
+        { id: 'g2', logic: 'and' },
+      ],
+      triggerMode: 'everyTime',
+      conditions: [condPriceAbove105, condPriceBelow50, condVolAbove300, cond5],
+    }
+
+    expect(evaluateAdvancedAlert(config, bars)).toBe(true)
+  })
+
+  it('preserves 100% backward compatibility for legacy flat alerts without groups', () => {
+    const legacyAnd: AdvancedAlertConfig = {
+      id: 'legacy-and',
+      logic: 'and',
+      triggerMode: 'everyTime',
+      conditions: [condPriceAbove105, condVolAbove300], // both true
+    }
+    expect(evaluateAdvancedAlert(legacyAnd, bars)).toBe(true)
+
+    const legacyOr: AdvancedAlertConfig = {
+      id: 'legacy-or',
+      logic: 'or',
+      triggerMode: 'everyTime',
+      conditions: [condPriceBelow50, condVolAbove300], // F or T = T
+      // groups is undefined, confirming legacy path works flawlessly
+    }
+    expect(evaluateAdvancedAlert(legacyOr, bars)).toBe(true)
+  })
+})
+
+describe('extended multi-group alerts (3 to 5 groups) with explicit boolean precedence', () => {
+  const bars: Bar[] = [
+    makeBar(60, 100, 102, 98, 100, 400),
+    makeBar(120, 100, 110, 99, 108, 500), // close=108, high=110, volume=500
+  ]
+
+  const condPriceAbove105: SingleAlertCondition = {
+    id: 'c1',
+    timeframe: 'chart',
+    left: { type: 'price', source: 'close' },
+    operator: 'greaterThan',
+    right: { type: 'value', value: 105 }, // TRUE (close=108)
+    groupId: 'g1',
+  }
+
+  const condPriceBelow50: SingleAlertCondition = {
+    id: 'c2',
+    timeframe: 'chart',
+    left: { type: 'price', source: 'close' },
+    operator: 'lessThan',
+    right: { type: 'value', value: 50 }, // FALSE (close=108)
+    groupId: 'g2',
+  }
+
+  const condVolAbove300: SingleAlertCondition = {
+    id: 'c3',
+    timeframe: 'chart',
+    left: { type: 'volume' },
+    operator: 'greaterThan',
+    right: { type: 'value', value: 300 }, // TRUE (volume=500)
+    groupId: 'g3',
+  }
+
+  const condHighAbove109: SingleAlertCondition = {
+    id: 'c4',
+    timeframe: 'chart',
+    left: { type: 'price', source: 'high' },
+    operator: 'greaterThan',
+    right: { type: 'value', value: 109 }, // TRUE (high=110)
+    groupId: 'g4',
+  }
+
+  const condVolAbove1000: SingleAlertCondition = {
+    id: 'c5',
+    timeframe: 'chart',
+    left: { type: 'volume' },
+    operator: 'greaterThan',
+    right: { type: 'value', value: 1000 }, // FALSE (volume=500)
+    groupId: 'g5',
+  }
+
+  it('evaluates 3 groups: (G1) AND (G2) OR (G3) where G1=T, G2=F, G3=T -> TRUE', () => {
+    // (T AND F) OR T = F OR T = TRUE
+    const config: AdvancedAlertConfig = {
+      id: '3-groups-1',
+      logic: 'or',
+      groups: [
+        { id: 'g1', name: 'Group 1', logic: 'and' },
+        { id: 'g2', name: 'Group 2', logic: 'and', connector: 'and' },
+        { id: 'g3', name: 'Group 3', logic: 'and', connector: 'or' },
+      ],
+      triggerMode: 'everyTime',
+      conditions: [condPriceAbove105, condPriceBelow50, condVolAbove300],
+    }
+
+    expect(evaluateAdvancedAlert(config, bars)).toBe(true)
+  })
+
+  it('evaluates 3 groups with explicit AND precedence: G1 OR (G2 AND G3)', () => {
+    // If G1=T, G2=T, G3=F:
+    // With AND precedence: T OR (T AND F) = T OR F = TRUE
+    // (If evaluated strictly left-to-right, (T OR T) AND F would be FALSE)
+    const config: AdvancedAlertConfig = {
+      id: '3-groups-precedence',
+      logic: 'or',
+      groups: [
+        { id: 'g1', name: 'Group 1', logic: 'and' },
+        { id: 'g2', name: 'Group 2', logic: 'and', connector: 'or' },
+        { id: 'g3', name: 'Group 3', logic: 'and', connector: 'and' }, // G3 ANDs with G2
+      ],
+      triggerMode: 'everyTime',
+      conditions: [
+        condPriceAbove105, // G1 = TRUE
+        condVolAbove300, // G2 = TRUE
+        condPriceBelow50, // G3 = FALSE
+      ],
+    }
+
+    expect(evaluateAdvancedAlert(config, bars)).toBe(true)
+  })
+
+  it('evaluates 4 groups: (G1) OR (G2) AND (G3) OR (G4)', () => {
+    // G1=F, G2=T, G3=T, G4=F
+    // F OR (T AND T) OR F = F OR T OR F = TRUE
+    const g1False = { ...condPriceBelow50, groupId: 'g1' }
+    const g2True = { ...condPriceAbove105, groupId: 'g2' }
+    const g3True = { ...condVolAbove300, groupId: 'g3' }
+    const g4False = { ...condVolAbove1000, groupId: 'g4' }
+
+    const config: AdvancedAlertConfig = {
+      id: '4-groups-test',
+      logic: 'or',
+      groups: [
+        { id: 'g1', name: 'Group 1', logic: 'and' },
+        { id: 'g2', name: 'Group 2', logic: 'and', connector: 'or' },
+        { id: 'g3', name: 'Group 3', logic: 'and', connector: 'and' },
+        { id: 'g4', name: 'Group 4', logic: 'and', connector: 'or' },
+      ],
+      triggerMode: 'everyTime',
+      conditions: [g1False, g2True, g3True, g4False],
+    }
+
+    expect(evaluateAdvancedAlert(config, bars)).toBe(true)
+  })
+
+  it('evaluates 5 distinct independent groups with mixed connectors and operators', () => {
+    // G1: close > 105 (T)
+    // G2: close < 50 (F), connector: OR
+    // G3: vol > 300 (T), connector: AND
+    // G4: high > 109 (T), connector: AND
+    // G5: vol > 1000 (F), connector: OR
+    // Structure: G1 OR (G2 AND G3 AND G4) OR G5 = T OR (F AND T AND T) OR F = T OR F OR F = TRUE
+    const config: AdvancedAlertConfig = {
+      id: '5-groups-full',
+      logic: 'or',
+      groups: [
+        { id: 'g1', name: 'Group 1', logic: 'and' },
+        { id: 'g2', name: 'Group 2', logic: 'and', connector: 'or' },
+        { id: 'g3', name: 'Group 3', logic: 'and', connector: 'and' },
+        { id: 'g4', name: 'Group 4', logic: 'and', connector: 'and' },
+        { id: 'g5', name: 'Group 5', logic: 'and', connector: 'or' },
+      ],
+      triggerMode: 'everyTime',
+      conditions: [
+        condPriceAbove105,
+        condPriceBelow50,
+        condVolAbove300,
+        condHighAbove109,
+        condVolAbove1000,
+      ],
+    }
+
+    expect(evaluateAdvancedAlert(config, bars)).toBe(true)
+  })
+
+  it('evaluates multi-group alerts with indicator crossovers (crossingUp / crossingDown)', () => {
+    // bar 0: close=95 (below 100)
+    // bar 1: close=105 (crosses up 100)
+    const crossoverBars: Bar[] = [
+      makeBar(60, 90, 96, 89, 95, 200),
+      makeBar(120, 96, 108, 95, 105, 600),
+    ]
+
+    const condCrossUp: SingleAlertCondition = {
+      id: 'c-cross',
+      timeframe: 'chart',
+      left: { type: 'price', source: 'close' },
+      operator: 'crossingUp',
+      right: { type: 'value', value: 100 }, // TRUE
+      groupId: 'g1',
+    }
+
+    const condVolCross: SingleAlertCondition = {
+      id: 'c-vol',
+      timeframe: 'chart',
+      left: { type: 'volume' },
+      operator: 'greaterThan',
+      right: { type: 'value', value: 500 }, // TRUE (volume=600)
+      groupId: 'g2',
+    }
+
+    const condDummy: SingleAlertCondition = {
+      id: 'c-dum',
+      timeframe: 'chart',
+      left: { type: 'price', source: 'close' },
+      operator: 'lessThan',
+      right: { type: 'value', value: 10 }, // FALSE
+      groupId: 'g3',
+    }
+
+    // (G1 AND G2) OR G3 = (T AND T) OR F = TRUE
+    const config: AdvancedAlertConfig = {
+      id: 'crossover-multi-group',
+      logic: 'or',
+      groups: [
+        { id: 'g1', name: 'Group 1', logic: 'and' },
+        { id: 'g2', name: 'Group 2', logic: 'and', connector: 'and' },
+        { id: 'g3', name: 'Group 3', logic: 'and', connector: 'or' },
+      ],
+      triggerMode: 'everyTime',
+      conditions: [condCrossUp, condVolCross, condDummy],
+    }
+
+    expect(evaluateAdvancedAlert(config, crossoverBars)).toBe(true)
+  })
+
+  it('evaluates multi-group alerts with mixed timeframes (chart + 5m + 15m)', () => {
+    // Generate 30 1-minute bars (ensures 6 5m bars and 2 15m bars, volume=500 each)
+    const mtfBars: Bar[] = Array.from({ length: 30 }, (_, i) =>
+      makeBar((i + 1) * 60, 100 + i, 105 + i, 99 + i, 102 + i, 500)
+    )
+
+    const condChart: SingleAlertCondition = {
+      id: 'c-chart',
+      timeframe: 'chart',
+      left: { type: 'price', source: 'close' },
+      operator: 'greaterThan',
+      right: { type: 'value', value: 110 }, // TRUE (bar 30 close = 131)
+      groupId: 'g1',
+    }
+
+    const cond5m: SingleAlertCondition = {
+      id: 'c-5m',
+      timeframe: '5m',
+      left: { type: 'volume' },
+      operator: 'greaterThan',
+      right: { type: 'value', value: 400 }, // TRUE (5m bar volume >= 500)
+      groupId: 'g2',
+    }
+
+    const cond15m: SingleAlertCondition = {
+      id: 'c-15m',
+      timeframe: '15m',
+      left: { type: 'volume' },
+      operator: 'greaterThan',
+      right: { type: 'value', value: 20000 }, // FALSE
+      groupId: 'g3',
+    }
+
+    // (G1 AND G2) OR G3 = (T AND T) OR F = TRUE
+    const config: AdvancedAlertConfig = {
+      id: 'mtf-multi-group',
+      logic: 'or',
+      groups: [
+        { id: 'g1', name: 'Group 1', logic: 'and' },
+        { id: 'g2', name: 'Group 2', logic: 'and', connector: 'and' },
+        { id: 'g3', name: 'Group 3', logic: 'and', connector: 'or' },
+      ],
+      triggerMode: 'everyTime',
+      conditions: [condChart, cond5m, cond15m],
+    }
+
+    expect(evaluateAdvancedAlert(config, mtfBars)).toBe(true)
+  })
+})
+
+describe('V1 formatPrecedenceExpression (AND before OR)', () => {
+  it('handles empty and single items correctly', () => {
+    expect(formatPrecedenceExpression([], [])).toBe('')
+    expect(formatPrecedenceExpression(['Rule #1'], [])).toBe('Rule #1')
+  })
+
+  it('formats 2 items with AND or OR connector', () => {
+    expect(formatPrecedenceExpression(['Rule #1', 'Rule #2'], ['and'])).toBe('Rule #1 AND Rule #2')
+    expect(formatPrecedenceExpression(['Rule #1', 'Rule #2'], ['or'])).toBe('Rule #1 OR Rule #2')
+  })
+
+  it('formats 3 items with uniform connectors without unnecessary parentheses', () => {
+    expect(formatPrecedenceExpression(['Rule #1', 'Rule #2', 'Rule #3'], ['and', 'and'])).toBe(
+      'Rule #1 AND Rule #2 AND Rule #3'
+    )
+    expect(formatPrecedenceExpression(['Rule #1', 'Rule #2', 'Rule #3'], ['or', 'or'])).toBe(
+      'Rule #1 OR Rule #2 OR Rule #3'
+    )
+  })
+
+  it('parenthesizes AND-groups when mixed with OR according to standard precedence', () => {
+    // (Rule #1 AND Rule #2) OR Rule #3
+    expect(formatPrecedenceExpression(['Rule #1', 'Rule #2', 'Rule #3'], ['and', 'or'])).toBe(
+      '(Rule #1 AND Rule #2) OR Rule #3'
+    )
+    // Rule #1 OR (Rule #2 AND Rule #3)
+    expect(formatPrecedenceExpression(['Rule #1', 'Rule #2', 'Rule #3'], ['or', 'and'])).toBe(
+      'Rule #1 OR (Rule #2 AND Rule #3)'
+    )
+    // (Rule #1 AND Rule #2) OR (Rule #3 AND Rule #4)
+    expect(
+      formatPrecedenceExpression(['Rule #1', 'Rule #2', 'Rule #3', 'Rule #4'], ['and', 'or', 'and'])
+    ).toBe('(Rule #1 AND Rule #2) OR (Rule #3 AND Rule #4)')
+  })
+})
+
+describe('V1 adjacent rules boolean evaluation with AND-before-OR precedence', () => {
+  const barsMatchClose102Vol500: Bar[] = [
+    makeBar(60, 100, 105, 99, 102, 500),
+    makeBar(120, 101, 106, 100, 102, 500),
+  ]
+  const barsMatchClose102Vol2000: Bar[] = [
+    makeBar(60, 100, 105, 99, 102, 2000),
+    makeBar(120, 101, 106, 100, 102, 2000),
+  ]
+  const barsMatchClose106Vol500: Bar[] = [
+    makeBar(60, 100, 105, 99, 106, 500),
+    makeBar(120, 101, 107, 100, 106, 500),
+  ]
+  const barsMatchClose95Vol2000: Bar[] = [
+    makeBar(60, 100, 105, 94, 95, 2000),
+    makeBar(120, 96, 98, 93, 95, 2000),
+  ]
+
+  // R1: close > 100
+  const r1: SingleAlertCondition = {
+    id: 'r1',
+    timeframe: 'chart',
+    left: { type: 'price', source: 'close' },
+    operator: 'greaterThan',
+    right: { type: 'value', value: 100 },
+  }
+  // R2: close > 105
+  const r2: SingleAlertCondition = {
+    id: 'r2',
+    timeframe: 'chart',
+    left: { type: 'price', source: 'close' },
+    operator: 'greaterThan',
+    right: { type: 'value', value: 105 },
+    connector: 'and',
+  }
+  // R3: volume > 1000
+  const r3: SingleAlertCondition = {
+    id: 'r3',
+    timeframe: 'chart',
+    left: { type: 'volume' },
+    operator: 'greaterThan',
+    right: { type: 'value', value: 1000 },
+    connector: 'or',
+  }
+
+  it('evaluates (R1 AND R2) OR R3 correctly with standard precedence', () => {
+    // Config: R1 AND R2 OR R3
+    // Connectors: between R1 & R2 is 'and', between R2 & R3 is 'or'
+    const config: AdvancedAlertConfig = {
+      id: 'r1-and-r2-or-r3',
+      logic: 'or',
+      triggerMode: 'everyTime',
+      conditions: [
+        r1,
+        { ...r2, connector: 'and' },
+        { ...r3, connector: 'or' },
+      ],
+    }
+
+    // 1) close=102, vol=500: R1=true, R2=false, R3=false => (T AND F) OR F => false
+    expect(evaluateAdvancedAlert(config, barsMatchClose102Vol500)).toBe(false)
+
+    // 2) close=102, vol=2000: R1=true, R2=false, R3=true => (T AND F) OR T => true
+    expect(evaluateAdvancedAlert(config, barsMatchClose102Vol2000)).toBe(true)
+
+    // 3) close=106, vol=500: R1=true, R2=true, R3=false => (T AND T) OR F => true
+    expect(evaluateAdvancedAlert(config, barsMatchClose106Vol500)).toBe(true)
+  })
+
+  it('evaluates R1 OR (R2 AND R3) correctly with standard precedence', () => {
+    // Config: R1 OR R2 AND R3
+    // Connectors: between R1 & R2 is 'or', between R2 & R3 is 'and'
+    const config: AdvancedAlertConfig = {
+      id: 'r1-or-r2-and-r3',
+      logic: 'or',
+      triggerMode: 'everyTime',
+      conditions: [
+        r1,
+        { ...r2, connector: 'or' },
+        { ...r3, connector: 'and' },
+      ],
+    }
+
+    // 1) close=102, vol=500: R1=true, R2=false, R3=false => T OR (F AND F) => true (R1 satisfies)
+    expect(evaluateAdvancedAlert(config, barsMatchClose102Vol500)).toBe(true)
+
+    // 2) close=95, vol=2000: R1=false, R2=false, R3=true => F OR (F AND T) => false
+    expect(evaluateAdvancedAlert(config, barsMatchClose95Vol2000)).toBe(false)
+
+    // 3) Change R2 to close < 100: on close=95, vol=2000:
+    // R1 (close > 100) = false, R2 (close < 100) = true, R3 (vol > 1000) = true
+    // F OR (T AND T) => true
+    const r2Alt: SingleAlertCondition = {
+      id: 'r2-alt',
+      timeframe: 'chart',
+      left: { type: 'price', source: 'close' },
+      operator: 'lessThan',
+      right: { type: 'value', value: 100 },
+      connector: 'or',
+    }
+    const configAlt: AdvancedAlertConfig = {
+      id: 'r1-or-r2alt-and-r3',
+      logic: 'or',
+      triggerMode: 'everyTime',
+      conditions: [
+        r1,
+        r2Alt,
+        { ...r3, connector: 'and' },
+      ],
+    }
+    expect(evaluateAdvancedAlert(configAlt, barsMatchClose95Vol2000)).toBe(true)
+  })
+
+  it('falls back to flat config.logic when conditions do not specify individual connectors', () => {
+    // 3 conditions without connectors, config.logic = 'and'
+    const flatAndConfig: AdvancedAlertConfig = {
+      id: 'flat-and',
+      logic: 'and',
+      triggerMode: 'everyTime',
+      conditions: [r1, { ...r2, connector: undefined }, { ...r3, connector: undefined }],
+    }
+    // close=102, vol=2000: R1=true, R2=false, R3=true => AND gives false
+    expect(evaluateAdvancedAlert(flatAndConfig, barsMatchClose102Vol2000)).toBe(false)
+
+    // config.logic = 'or'
+    const flatOrConfig: AdvancedAlertConfig = {
+      id: 'flat-or',
+      logic: 'or',
+      triggerMode: 'everyTime',
+      conditions: [r1, { ...r2, connector: undefined }, { ...r3, connector: undefined }],
+    }
+    // close=102, vol=500: R1=true, R2=false, R3=false => OR gives true
+    expect(evaluateAdvancedAlert(flatOrConfig, barsMatchClose102Vol500)).toBe(true)
   })
 })

@@ -568,12 +568,12 @@ function drawingColorInput(color: string): string {
   const rgb = drawingRgb(color)
   return rgb
     ? `#${rgb
-        .map((channel) =>
-          Math.max(0, Math.min(255, Math.round(channel)))
-            .toString(16)
-            .padStart(2, '0')
-        )
-        .join('')}`
+      .map((channel) =>
+        Math.max(0, Math.min(255, Math.round(channel)))
+          .toString(16)
+          .padStart(2, '0')
+      )
+      .join('')}`
     : '#000000'
 }
 
@@ -614,6 +614,12 @@ export interface AlertsHandle {
   drawings: AlertDrawings | null
   /** What this chart is showing, for naming an alert after it. */
   symbol: string
+  /** Active chart interval (e.g. '1m', '5m', 'D'). */
+  interval?: string
+  /** Exchange code of the instrument (e.g. NSE, NFO, BSE). */
+  exchange?: string
+  /** Instrument metadata (hasOpenInterest, hasVolume, instrumenttype, expiry, strike). */
+  instrumentInfo?: Record<string, unknown>
   /** The instrument's tick, so every stored price sits on one. */
   at: AlertTick
   /** A source to open the editor on, from a legend or a right-click. */
@@ -1133,12 +1139,12 @@ export class TradingTerminal {
   private drawShortcuts: Record<string, string> = {}
   private matchShortcut:
     | ((e: {
-        key: string
-        altKey?: boolean
-        ctrlKey?: boolean
-        metaKey?: boolean
-        shiftKey?: boolean
-      }) => string | null)
+      key: string
+      altKey?: boolean
+      ctrlKey?: boolean
+      metaKey?: boolean
+      shiftKey?: boolean
+    }) => string | null)
     | null = null
   /**
    * What a key means for the selection or the placement in hand. The tier
@@ -1147,20 +1153,20 @@ export class TradingTerminal {
    */
   private keyAction:
     | ((
-        e: {
-          key: string
-          ctrlKey?: boolean
-          metaKey?: boolean
-          shiftKey?: boolean
-          altKey?: boolean
-        },
-        ctx: {
-          hasSelection: boolean
-          hasTarget: boolean
-          editingText: boolean
-          placing?: boolean
-        }
-      ) => { type: string; dx?: number; dy?: number } | null)
+      e: {
+        key: string
+        ctrlKey?: boolean
+        metaKey?: boolean
+        shiftKey?: boolean
+        altKey?: boolean
+      },
+      ctx: {
+        hasSelection: boolean
+        hasTarget: boolean
+        editingText: boolean
+        placing?: boolean
+      }
+    ) => { type: string; dx?: number; dy?: number } | null)
     | null = null
   /** The tier's tool registry, for a tool's own defaults; null until it loads. */
   private toolOf: ((id: string) => DrawingTool) | null = null
@@ -1337,9 +1343,9 @@ export class TradingTerminal {
     /** The finer choice of four, kept beside `mode` (see `comparisonScale.ts`). */
     scale?: ComparisonScale
   } = {
-    items: [],
-    mode: 'percent',
-  }
+      items: [],
+      mode: 'percent',
+    }
 
   /**
    * Whether this chart is watching a price for somebody.
@@ -2114,10 +2120,10 @@ export class TradingTerminal {
     }
     this.position = pos
       ? {
-          net: Number(pos.quantity),
-          avg: Number(pos.average_price),
-          product: String(pos.product ?? ''),
-        }
+        net: Number(pos.quantity),
+        avg: Number(pos.average_price),
+        product: String(pos.product ?? ''),
+      }
       : null
     if (!this.position || !this.chart || this.position.net === 0) {
       this.position = this.position && this.position.net !== 0 ? this.position : null
@@ -2549,13 +2555,13 @@ export class TradingTerminal {
     this.chart.setDataContext(
       this.sym
         ? {
-            symbol: this.sym.symbol,
-            exchange: this.sym.exchange,
-            interval: this.interval,
-            hasOpenInterest: this.sym.synthetic
-              ? false
-              : (this.sym.hasOpenInterest ?? openInterestCapability(this.sym.exchange)),
-          }
+          symbol: this.sym.symbol,
+          exchange: this.sym.exchange,
+          interval: this.interval,
+          hasOpenInterest: this.sym.synthetic
+            ? false
+            : (this.sym.hasOpenInterest ?? openInterestCapability(this.sym.exchange)),
+        }
         : { interval: this.interval }
     )
     // Trading hours for the axis past the last bar and the bottom bar's status.
@@ -3994,7 +4000,7 @@ export class TradingTerminal {
   private completeIndicatorCatalogue(): void {
     if (this.destroyed) return
     const run = () => {
-      if (!this.destroyed) void this.loadIndicators().catch(() => {})
+      if (!this.destroyed) void this.loadIndicators().catch(() => { })
     }
     // Called on the global itself: a browser refuses requestIdleCallback detached
     // from window with an illegal invocation.
@@ -4461,10 +4467,15 @@ export class TradingTerminal {
         chart as unknown as AlertChart,
         (this.draw ?? null) as AlertDrawings | null,
         this.sym?.symbol ?? '',
-        at
+        at,
+        this.interval,
+        this.sym?.exchange ?? ''
       )
       if (input === null) return false
       const made = this.alerts.add(input)
+      if (input.scope && made?.id) {
+        this.alerts.update(made.id, { scope: input.scope } as AlertPatch)
+      }
       // Borrowed from the click that made it: a browser starts an audio context
       // suspended and only asks about notifications inside a gesture, and this
       // is the gesture. Without it the first alert to fire hours later is silent
@@ -4501,6 +4512,19 @@ export class TradingTerminal {
           chart: chart as unknown as AlertChart,
           drawings: (this.draw ?? null) as AlertDrawings | null,
           symbol: this.sym?.symbol ?? '',
+          interval: this.interval,
+          exchange: this.sym?.exchange ?? '',
+          instrumentInfo: this.sym
+            ? {
+              instrumenttype: this.sym.quoteOnly
+                ? 'INDEX'
+                : this.sym.synthetic
+                  ? 'SPOT'
+                  : undefined,
+              hasOpenInterest: this.sym.hasOpenInterest,
+              hasVolume: !this.sym.quoteOnly,
+            }
+            : undefined,
           at: { tick: this.sym?.tick, refPrice: this.refPrice() },
           ...(source ? { source } : {}),
           ...(editAlertId ? { editAlertId } : {}),
@@ -4784,11 +4808,11 @@ export class TradingTerminal {
         i.type === 'colorPair'
           ? (i as unknown as ChartSettingsPairField)
           : {
-              ...toField(i as { key: string; type: string; label?: string; group?: string }),
-              ...(i.key === 'statusLine.openInterest' && chart.hasOpenInterest === false
-                ? { unavailable: 'Open interest is unavailable for this instrument.' }
-                : {}),
-            }
+            ...toField(i as { key: string; type: string; label?: string; group?: string }),
+            ...(i.key === 'statusLine.openInterest' && chart.hasOpenInterest === false
+              ? { unavailable: 'Open interest is unavailable for this instrument.' }
+              : {}),
+          }
       ),
     }))
     return priceAxisSettingsView(
@@ -5130,7 +5154,7 @@ export class TradingTerminal {
     const chart = this.chart
     if (!chart || this.destroyed) {
       onValue(null)
-      return () => {}
+      return () => { }
     }
     const zone = chart.timezone()
     const clock = (time: number) =>
@@ -5212,11 +5236,11 @@ export class TradingTerminal {
         feed,
         ...(this.timeframes
           ? {
-              bucketStart: (request: BarsRequest, time: number) =>
-                sessionCalendar({ ...request, from: time, to: time + 1 })
-                  ? this.timeframes!.bucketStart(request, time)
-                  : null,
-            }
+            bucketStart: (request: BarsRequest, time: number) =>
+              sessionCalendar({ ...request, from: time, to: time + 1 })
+                ? this.timeframes!.bucketStart(request, time)
+                : null,
+          }
           : {}),
         ws: { url: this.wsUrl, apiKey: this.apiKey },
         now: () => this.gridNow(),
@@ -5276,7 +5300,7 @@ export class TradingTerminal {
       throw new Error('Leave replay before adding a comparison')
     if (isChartExpression(symbol)) throw new Error('Choose an instrument for comparison')
     if (!this.comparisons) this.installComparisons()
-    await this.comparisonLoad.catch(() => {})
+    await this.comparisonLoad.catch(() => { })
     if (
       this.destroyed ||
       chart !== this.chart ||
@@ -6535,28 +6559,28 @@ export class TradingTerminal {
     const sessionAnchorSec = this.rawBars[this.rawBars.length - 1]?.time ?? 0
     this.builder = sec
       ? new CandleBuilder({
-          intervalSec: sec,
-          volumeMode: 'ltq-sum',
-          sessionAnchorSec,
-          ...(this.timeframes &&
+        intervalSec: sec,
+        volumeMode: 'ltq-sum',
+        sessionAnchorSec,
+        ...(this.timeframes &&
           sessionCalendar({
             symbol: '',
             exchange: this.sym?.exchange || this.exprLegExchange,
             interval: this.interval,
           })
-            ? {
-                bucketStart: (time) =>
-                  this.timeframes!.bucketStart(
-                    {
-                      symbol: this.sym?.symbol ?? '',
-                      exchange: this.sym?.exchange || this.exprLegExchange,
-                      interval: this.interval,
-                    },
-                    time
-                  ),
-              }
-            : {}),
-        })
+          ? {
+            bucketStart: (time) =>
+              this.timeframes!.bucketStart(
+                {
+                  symbol: this.sym?.symbol ?? '',
+                  exchange: this.sym?.exchange || this.exprLegExchange,
+                  interval: this.interval,
+                },
+                time
+              ),
+          }
+          : {}),
+      })
       : null
     // History normally ends *inside* the bar currently forming. An unseeded
     // builder has no current bar, so its first tick opens a second one for that
@@ -6627,28 +6651,28 @@ export class TradingTerminal {
     // the bar closes brings the open it missed.
     this.builder = sec
       ? new CandleBuilder({
-          intervalSec: sec,
-          volumeMode: 'ltq-sum',
-          sessionAnchorSec,
-          ...(this.timeframes &&
+        intervalSec: sec,
+        volumeMode: 'ltq-sum',
+        sessionAnchorSec,
+        ...(this.timeframes &&
           sessionCalendar({
             symbol: '',
             exchange: this.sym?.exchange || this.exprLegExchange,
             interval: this.interval,
           })
-            ? {
-                bucketStart: (time) =>
-                  this.timeframes!.bucketStart(
-                    {
-                      symbol: this.sym?.symbol ?? '',
-                      exchange: this.sym?.exchange || this.exprLegExchange,
-                      interval: this.interval,
-                    },
-                    time
-                  ),
-              }
-            : {}),
-        })
+          ? {
+            bucketStart: (time) =>
+              this.timeframes!.bucketStart(
+                {
+                  symbol: this.sym?.symbol ?? '',
+                  exchange: this.sym?.exchange || this.exprLegExchange,
+                  interval: this.interval,
+                },
+                time
+              ),
+          }
+          : {}),
+      })
       : null
     if (this.builder && this.rawBars.length) {
       this.builder.seed(this.rawBars[this.rawBars.length - 1])
@@ -7176,7 +7200,17 @@ export class TradingTerminal {
     this.lsSet('interval', iv)
     this.cb.onIntervalChange?.(iv)
     if (this.link && this.chart) this.link.setInterval(this.chart, iv)
+    if (this.chart) {
+      try {
+        this.chart.setDataContext({
+          symbol: this.sym?.symbol ?? '',
+          exchange: this.sym?.exchange ?? '',
+          interval: iv,
+        })
+      } catch { }
+    }
     if (this.sym) this.reloadCurrent()
+    this.cb.onAlertsChanged?.()
     return iv
   }
   setChartType(v: string): string {
@@ -7617,10 +7651,10 @@ export class TradingTerminal {
         ) ?? undefined,
       drawing: this.draw
         ? {
-            id: clicked,
-            removable: drawingCounts(this.draw).removable,
-            paste: drawingsOnClipboard(),
-          }
+          id: clicked,
+          removable: drawingCounts(this.draw).removable,
+          paste: drawingsOnClipboard(),
+        }
         : undefined,
     })
   }
@@ -7817,7 +7851,7 @@ export class TradingTerminal {
     }
   }
 
-  private settleReady: () => void = () => {}
+  private settleReady: () => void = () => { }
   private readonly ready = new Promise<void>((resolve) => {
     this.settleReady = resolve
   })

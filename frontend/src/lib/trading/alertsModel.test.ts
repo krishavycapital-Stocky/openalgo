@@ -34,6 +34,7 @@ import {
   needsThreshold,
   plotChoices,
   plotValueAt,
+  resolveAlertInterval,
   snapPrice,
   studyChoices,
   titleFor,
@@ -603,6 +604,29 @@ describe('the draft a right-click and the form both start from', () => {
     expect(draftProblem(invalid, chart(), drawings)).toBe('Add at least one condition.')
   })
 
+  it('preserves existing barCondition config ID when editing an advanced alert', () => {
+    const editingDraft = draft({
+      kind: 'advanced',
+      barConditionId: 'adv_alert_stable_config_123',
+      advancedConditions: [
+        {
+          id: 'c1',
+          timeframe: 'chart',
+          left: { type: 'price', source: 'close' },
+          operator: 'greaterThan',
+          right: { type: 'value', value: 100 },
+        },
+      ],
+    })
+    const input = toAlertInput(editingDraft, chart(), drawings, 'NIFTY')
+    expect(input?.source).toMatchObject({
+      kind: 'barCondition',
+      id: 'adv_alert_stable_config_123',
+    })
+    const payload = input?.payload as { advancedConfig?: { id: string } }
+    expect(payload?.advancedConfig?.id).toBe('stable_config_123')
+  })
+
   it('validates multi-condition rules (rejects indicator left operand with no indicator selected)', () => {
     const invalid = draft({
       kind: 'advanced',
@@ -677,5 +701,331 @@ describe('the draft a right-click and the form both start from', () => {
     expect(restored.advancedLogic).toBe('or')
     expect(restored.advancedConditions?.length).toBe(1)
     expect(restored.advancedConditions?.[0]?.timeframe).toBe('15m')
+  })
+
+  it('rejects volume conditions on index instruments', () => {
+    const invalid = draft({
+      kind: 'advanced',
+      exchange: 'NSE_INDEX',
+      advancedConditions: [
+        {
+          id: 'c1',
+          timeframe: 'chart',
+          left: { type: 'volume' },
+          operator: 'greaterThan',
+          right: { type: 'value', value: 1000 },
+        },
+      ],
+    })
+    expect(draftProblem(invalid, chart(), drawings, 'NIFTY 50')).toContain(
+      'Volume is not available on index instruments'
+    )
+  })
+
+  it('rejects open interest conditions on cash equities', () => {
+    const invalid = draft({
+      kind: 'advanced',
+      exchange: 'NSE',
+      instrumentInfo: { instrumenttype: 'EQ' },
+      advancedConditions: [
+        {
+          id: 'c1',
+          timeframe: 'chart',
+          left: { type: 'openInterest' },
+          operator: 'greaterThan',
+          right: { type: 'value', value: 1000 },
+        },
+      ],
+    })
+    expect(draftProblem(invalid, chart(), drawings, 'RELIANCE')).toContain(
+      'Open Interest is only available on derivative contracts'
+    )
+  })
+
+  it('rejects arming alerts on expired derivative contracts', () => {
+    const invalid = draft({
+      kind: 'price',
+      exchange: 'NFO',
+      instrumentInfo: {
+        instrumenttype: 'CE',
+        expiry: '2020-01-01', // Expired in past
+      },
+    })
+    expect(draftProblem(invalid, chart(), drawings, 'NIFTY20JAN12000CE')).toContain('has expired')
+  })
+
+  it('restores mixed AND/OR groups when editing an existing alert', () => {
+    const existingGroupedAlert = {
+      id: 'existing_grouped',
+      source: { kind: 'barCondition', id: 'adv_alert_grp' },
+      condition: 'matches',
+      policy: 'onBarClose',
+      repeat: 'everyTime',
+      state: 'armed',
+      title: 'Grouped Alert',
+      payload: {
+        advancedConfig: {
+          id: 'grp_123',
+          logic: 'or',
+          groups: [
+            { id: 'g1', logic: 'and' },
+            { id: 'g2', logic: 'or' },
+          ],
+          conditions: [
+            {
+              id: 'c1',
+              timeframe: 'chart',
+              left: { type: 'price', source: 'close' },
+              operator: 'greaterThan',
+              right: { type: 'value', value: 100 },
+              groupId: 'g1',
+            },
+            {
+              id: 'c2',
+              timeframe: 'chart',
+              left: { type: 'volume' },
+              operator: 'greaterThan',
+              right: { type: 'value', value: 5000 },
+              groupId: 'g2',
+            },
+          ],
+        },
+      },
+    }
+
+    const restored = draftFor({
+      chart: chart(),
+      drawings,
+      zone,
+      at,
+      existing: existingGroupedAlert as never,
+    })
+
+    expect(restored.advancedGroups?.length).toBe(2)
+    expect(restored.advancedGroups?.[0]?.logic).toBe('and')
+    expect(restored.advancedGroups?.[1]?.logic).toBe('or')
+    expect(restored.advancedConditions?.[1]?.groupId).toBe('g2')
+  })
+
+  it('restores and handles up to 5 groups with custom names and connectors', () => {
+    const existing5GroupAlert = {
+      id: 'alert_5groups',
+      symbol: 'NIFTY',
+      condition: 'matches',
+      policy: 'onBarClose',
+      repeat: 'everyTime',
+      state: 'armed',
+      title: '5 Groups Alert',
+      payload: {
+        advancedConfig: {
+          id: 'test5',
+          logic: 'or',
+          conditions: [
+            {
+              id: 'c1',
+              timeframe: 'chart',
+              left: { type: 'price', source: 'close' },
+              operator: 'crossing',
+              right: { type: 'value', value: 100 },
+              groupId: 'g1',
+            },
+            {
+              id: 'c2',
+              timeframe: 'chart',
+              left: { type: 'volume' },
+              operator: 'greaterThan',
+              right: { type: 'value', value: 500 },
+              groupId: 'g2',
+            },
+            {
+              id: 'c3',
+              timeframe: 'chart',
+              left: { type: 'price', source: 'high' },
+              operator: 'greaterThan',
+              right: { type: 'value', value: 105 },
+              groupId: 'g3',
+            },
+            {
+              id: 'c4',
+              timeframe: 'chart',
+              left: { type: 'volume' },
+              operator: 'greaterThan',
+              right: { type: 'value', value: 1000 },
+              groupId: 'g4',
+            },
+            {
+              id: 'c5',
+              timeframe: 'chart',
+              left: { type: 'price', source: 'low' },
+              operator: 'lessThan',
+              right: { type: 'value', value: 95 },
+              groupId: 'g5',
+            },
+          ],
+          groups: [
+            { id: 'g1', name: 'Group 1', logic: 'and' },
+            { id: 'g2', name: 'Group 2', logic: 'and', connector: 'or' },
+            { id: 'g3', name: 'Group 3', logic: 'or', connector: 'and' },
+            { id: 'g4', name: 'Group 4', logic: 'and', connector: 'and' },
+            { id: 'g5', name: 'Group 5', logic: 'or', connector: 'or' },
+          ],
+        },
+      },
+    }
+
+    const restored = draftFor({
+      chart: chart(),
+      drawings,
+      zone,
+      at,
+      existing: existing5GroupAlert as never,
+    })
+
+    expect(restored.advancedGroups?.length).toBe(5)
+    expect(restored.advancedGroups?.[4]?.id).toBe('g5')
+    expect(restored.advancedGroups?.[4]?.connector).toBe('or')
+    expect(restored.advancedConditions?.length).toBe(5)
+
+    // Verify title formatting for 5 groups
+    const title = titleFor(restored, chart(), 'NIFTY', at)
+    expect(title).toContain('5 Groups')
+
+    // Verify draftProblem passes with 5 populated groups
+    expect(draftProblem(restored, chart(), drawings, 'NIFTY')).toBeNull()
+
+    // Verify draftProblem flags when a group has no assigned conditions
+    const emptyGroupDraft: AlertDraft = {
+      ...restored,
+      advancedGroups: [
+        ...restored.advancedGroups!,
+        { id: 'g6', name: 'Group 6', logic: 'and', connector: 'and' },
+      ],
+    }
+    const problem = draftProblem(emptyGroupDraft, chart(), drawings, 'NIFTY')
+    expect(problem).toContain('Multi-condition alerts support up to 5 groups')
+
+    // Verify toAlertInput passes groups with connectors cleanly
+    const input = toAlertInput(restored, chart(), drawings, 'NIFTY', at)
+    expect(input).not.toBeNull()
+    const advConfig = (input?.payload as any)?.advancedConfig
+    expect(advConfig?.groups?.length).toBe(5)
+    expect(advConfig?.groups?.[2]?.connector).toBe('and')
+  })
+
+  describe('Timeframe Synchronization & Scope Resolution', () => {
+    it('resolves alert interval when all rules are explicitly set to 1m', () => {
+      const advDraft = draft({
+        kind: 'advanced',
+        advancedConditions: [
+          {
+            id: 'c1',
+            timeframe: '1m',
+            left: { type: 'price', source: 'close' },
+            operator: 'greaterThan',
+            right: { type: 'value', value: 100 },
+          },
+          {
+            id: 'c2',
+            timeframe: '1m',
+            left: { type: 'volume' },
+            operator: 'greaterThan',
+            right: { type: 'value', value: 500 },
+            connector: 'and',
+          },
+        ],
+      })
+
+      expect(resolveAlertInterval(advDraft, '1m')).toBe('1m')
+      // Even if chart was temporarily on 5m, explicit 1m rules require 1m parent interval
+      expect(resolveAlertInterval(advDraft, '5m')).toBe('1m')
+    })
+
+    it('resolves alert interval when rules use chart interval', () => {
+      const advDraft = draft({
+        kind: 'advanced',
+        advancedConditions: [
+          {
+            id: 'c1',
+            timeframe: 'chart',
+            left: { type: 'price', source: 'close' },
+            operator: 'greaterThan',
+            right: { type: 'value', value: 100 },
+          },
+        ],
+      })
+
+      expect(resolveAlertInterval(advDraft, '1m')).toBe('1m')
+      expect(resolveAlertInterval(advDraft, '5m')).toBe('5m')
+      expect(resolveAlertInterval(advDraft, '15m')).toBe('15m')
+    })
+
+    it('resolves base interval to minimum timeframe for mixed multi-timeframe rules', () => {
+      const advDraft = draft({
+        kind: 'advanced',
+        advancedConditions: [
+          {
+            id: 'c1',
+            timeframe: '1m',
+            left: { type: 'price', source: 'close' },
+            operator: 'greaterThan',
+            right: { type: 'value', value: 100 },
+          },
+          {
+            id: 'c2',
+            timeframe: '5m',
+            left: { type: 'volume' },
+            operator: 'greaterThan',
+            right: { type: 'value', value: 500 },
+            connector: 'and',
+          },
+        ],
+      })
+
+      // 1m base bars are required to evaluate 1m rule (5m can be resampled from 1m)
+      expect(resolveAlertInterval(advDraft, '1m')).toBe('1m')
+      expect(resolveAlertInterval(advDraft, '5m')).toBe('1m')
+    })
+
+    it('toAlertInput outputs scope with correct interval and exchange', () => {
+      const advDraft = draft({
+        kind: 'advanced',
+        advancedConditions: [
+          {
+            id: 'c1',
+            timeframe: '1m',
+            left: { type: 'price', source: 'close' },
+            operator: 'greaterThan',
+            right: { type: 'value', value: 100 },
+          },
+          {
+            id: 'c2',
+            timeframe: '1m',
+            left: { type: 'volume' },
+            operator: 'greaterThan',
+            right: { type: 'value', value: 500 },
+            connector: 'and',
+          },
+        ],
+      })
+
+      const input = toAlertInput(advDraft, chart(), drawings, 'NIFTY', undefined, '1m', 'NSE')
+      expect(input).not.toBeNull()
+      expect(input?.scope).toEqual({
+        symbol: 'NIFTY',
+        exchange: 'NSE',
+        interval: '1m',
+      })
+    })
+
+    it('toAlertInput includes scope for standard price alerts matching active chart interval', () => {
+      const priceDraft = draft({ kind: 'price', value: '1500' })
+      const input = toAlertInput(priceDraft, chart(), drawings, 'RELIANCE', undefined, '5m', 'NSE')
+      expect(input).not.toBeNull()
+      expect(input?.scope).toEqual({
+        symbol: 'RELIANCE',
+        exchange: 'NSE',
+        interval: '5m',
+      })
+    })
   })
 })

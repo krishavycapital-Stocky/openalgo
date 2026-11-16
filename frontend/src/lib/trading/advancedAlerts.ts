@@ -22,7 +22,7 @@ export type ConditionOperator =
   | 'enteringRange'
   | 'leavingRange'
 
-export type OperandType = 'price' | 'indicator' | 'value'
+export type OperandType = 'price' | 'indicator' | 'value' | 'volume' | 'openInterest'
 
 export type BuiltinIndicatorType =
   | 'ema'
@@ -52,18 +52,29 @@ export interface ConditionOperand {
   readonly source?: 'close' | 'open' | 'high' | 'low' | 'hl2' | 'hlc3'
 }
 
+export interface ConditionGroupConfig {
+  readonly id: string
+  readonly name?: string
+  readonly logic: 'and' | 'or'
+  readonly connector?: 'and' | 'or' // Connector with the preceding group (for groups > 0)
+}
+
 export interface SingleAlertCondition {
   readonly id: string
   readonly timeframe: string // 'chart' | '1m' | '3m' | '5m' | '15m' | '30m' | '1h' | '1D'
   readonly left: ConditionOperand
   readonly operator: ConditionOperator
   readonly right: ConditionOperand
+  readonly groupId?: string // Group identifier e.g. 'g1', 'g2' (legacy)
+  readonly connector?: 'and' | 'or' // Connector with the preceding rule (for rule index > 0)
 }
 
 export interface AdvancedAlertConfig {
   readonly id: string
-  readonly logic: 'and' | 'or'
+  readonly logic: 'and' | 'or' // Top-level logic connecting groups / legacy fallback
   readonly conditions: readonly SingleAlertCondition[]
+  readonly connectors?: readonly ('and' | 'or')[] // Connectors between adjacent rules (Priority 1 V1)
+  readonly groups?: readonly ConditionGroupConfig[] // Config for legacy condition groups
   readonly triggerMode: AlertTriggerMode
   readonly cooldownSeconds?: number
   readonly lastFiredBarTime?: number
@@ -82,8 +93,14 @@ export const TIMEFRAME_OPTIONS: readonly { value: string; label: string; seconds
 ]
 
 export function timeframeToSeconds(tf: string): number {
-  const found = TIMEFRAME_OPTIONS.find((one) => one.value === tf)
-  return found ? found.seconds : 0
+  if (!tf) return 0
+  const found = TIMEFRAME_OPTIONS.find((one) => one.value.toLowerCase() === tf.toLowerCase())
+  if (found) return found.seconds
+  const lower = tf.toLowerCase()
+  if (lower === 'd' || lower === '1d') return 86400
+  if (lower === 'w' || lower === '1w') return 86400 * 7
+  if (lower === 'm' || lower === '1m') return 60
+  return 0
 }
 
 /* ── Candle Resampling ───────────────────────────────────────────────────── */
@@ -113,14 +130,18 @@ export function resampleBars(bars: readonly Bar[], targetSeconds: number): Bar[]
         high: bar.high,
         low: bar.low,
         close: bar.close,
-        volume: bar.volume ?? 0,
+        ...(bar.volume !== undefined && bar.volume !== null ? { volume: bar.volume } : {}),
+        ...(bar.oi !== undefined && bar.oi !== null ? { oi: bar.oi } : {}),
       }
     } else {
       currentBucket.high = Math.max(currentBucket.high, bar.high)
       currentBucket.low = Math.min(currentBucket.low, bar.low)
       currentBucket.close = bar.close
-      if (bar.volume !== undefined) {
+      if (bar.volume !== undefined && bar.volume !== null) {
         currentBucket.volume = (currentBucket.volume ?? 0) + bar.volume
+      }
+      if (bar.oi !== undefined && bar.oi !== null) {
+        currentBucket.oi = bar.oi
       }
     }
   }
@@ -506,6 +527,32 @@ export function resolveOperandSeries(
     return extractSourceSeries(bars, operand.source)
   }
 
+  if (operand.type === 'volume') {
+    const volData = bars.map((b) =>
+      b.volume !== undefined && b.volume !== null && Number.isFinite(b.volume) ? b.volume : NaN
+    )
+    if (operand.indicator === 'sma') {
+      return calculateSMA(volData, operand.period ?? 20)
+    }
+    if (operand.indicator === 'ema') {
+      return calculateEMA(volData, operand.period ?? 20)
+    }
+    return volData
+  }
+
+  if (operand.type === 'openInterest') {
+    const oiData = bars.map((b) =>
+      b.oi !== undefined && b.oi !== null && Number.isFinite(b.oi) ? b.oi : NaN
+    )
+    if (operand.indicator === 'sma') {
+      return calculateSMA(oiData, operand.period ?? 14)
+    }
+    if (operand.indicator === 'ema') {
+      return calculateEMA(oiData, operand.period ?? 14)
+    }
+    return oiData
+  }
+
   // Indicator:
   if (operand.type === 'indicator') {
     // Check if reading from an active chart study instance
@@ -657,8 +704,51 @@ export function evaluateSingleCondition(
 }
 
 /**
+ * Formats a live expression of adjacent rules according to standard AND-before-OR precedence.
+ * Parenthesizes AND-groups when mixed with OR, giving a clear, mathematically unambiguous display.
+ */
+export function formatPrecedenceExpression(
+  items: readonly string[],
+  connectors: readonly ('and' | 'or')[]
+): string {
+  if (items.length === 0) return ''
+  if (items.length === 1) return items[0]!
+
+  // Cluster items into AND-groups
+  const andGroups: string[][] = [[items[0]!]]
+  for (let i = 1; i < items.length; i++) {
+    const conn = connectors[i - 1] ?? 'and'
+    if (conn === 'and') {
+      andGroups[andGroups.length - 1]!.push(items[i]!)
+    } else {
+      andGroups.push([items[i]!])
+    }
+  }
+
+  // If there's only 1 AND-group, all items are connected by AND
+  if (andGroups.length === 1) {
+    return andGroups[0]!.join(' AND ')
+  }
+
+  // If every AND-group has length 1, all items are connected by OR
+  if (andGroups.every((g) => g.length === 1)) {
+    return andGroups.map((g) => g[0]!).join(' OR ')
+  }
+
+  // Mixed AND/OR: Parenthesize AND-groups that have >1 item
+  return andGroups
+    .map((g) => (g.length > 1 ? `(${g.join(' AND ')})` : g[0]!))
+    .join(' OR ')
+}
+
+/**
  * Evaluates all conditions of an advanced multi-condition alert.
- * Uses AND logic (all conditions must be true).
+ * Supports:
+ * - Version 1 simplified rules (up to 3 rules) with adjacent AND/OR connectors and
+ *   standard AND-before-OR precedence.
+ * - Legacy flat logic: AND / OR across all conditions.
+ * - Legacy mixed grouping: Multiple groups (up to 5 conditions total), each group having its own
+ *   inner logic (AND / OR), combined by inter-group connectors (AND / OR).
  */
 export function evaluateAdvancedAlert(
   config: AdvancedAlertConfig,
@@ -667,70 +757,153 @@ export function evaluateAdvancedAlert(
 ): boolean {
   if (config.conditions.length === 0) return false
 
-  if (config.logic === 'or') {
-    for (const cond of config.conditions) {
-      if (evaluateSingleCondition(cond, baseBars, chartIndicators)) return true
+  // Mixed grouped evaluation when groups are configured with 2 or more groups (legacy support)
+  if (config.groups && config.groups.length > 1) {
+    const activeGroups: { group: ConditionGroupConfig; result: boolean }[] = []
+
+    for (const group of config.groups) {
+      // Find conditions assigned to this group. If condition has no groupId, assign to first group.
+      const groupConditions = config.conditions.filter((cond) => {
+        const gid = cond.groupId || config.groups![0]!.id
+        return gid === group.id
+      })
+
+      if (groupConditions.length === 0) continue
+
+      if (group.logic === 'or') {
+        let anyTrue = false
+        for (const cond of groupConditions) {
+          if (evaluateSingleCondition(cond, baseBars, chartIndicators)) {
+            anyTrue = true
+            break
+          }
+        }
+        activeGroups.push({ group, result: anyTrue })
+      } else {
+        // Group logic is 'and'
+        let allTrue = true
+        for (const cond of groupConditions) {
+          if (!evaluateSingleCondition(cond, baseBars, chartIndicators)) {
+            allTrue = false
+            break
+          }
+        }
+        activeGroups.push({ group, result: allTrue })
+      }
     }
-    return false
-  }
 
-  // Default: AND logic
-  for (const cond of config.conditions) {
-    if (!evaluateSingleCondition(cond, baseBars, chartIndicators)) {
-      return false
+    if (activeGroups.length === 0) return false
+    if (activeGroups.length === 1) return activeGroups[0]!.result
+
+    // Evaluate connectors between groups with explicit boolean precedence:
+    // AND operations take precedence over OR operations.
+    // Build AND-connected terms, then OR across the terms.
+    const terms: boolean[] = []
+    let currentTerm = activeGroups[0]!.result
+
+    for (let i = 1; i < activeGroups.length; i++) {
+      const g = activeGroups[i]!.group
+      // Backward compatibility: If connector is not set, default to config.logic (or 'or')
+      const connector = g.connector ?? config.logic ?? 'or'
+      const val = activeGroups[i]!.result
+
+      if (connector === 'and') {
+        currentTerm = currentTerm && val
+      } else {
+        terms.push(currentTerm)
+        currentTerm = val
+      }
     }
-  }
-  return true
-}
+    terms.push(currentTerm)
 
-/* ── BarCondition Registration for OpenAlgo-Charts ────────────────────────── */
-
-const registeredConditions = new Map<string, AdvancedAlertConfig>()
-
-/**
- * Registers an advanced multi-condition alert into openalgo-charts' BarCondition system.
- * Returns the condition ID.
- */
-export function registerAdvancedAlertCondition(config: AdvancedAlertConfig): string {
-  const conditionId = `adv_alert_${config.id}`
-  // Alert restoration may run more than once (for example during React remounts).
-  // Keep the registered callback and refresh its configuration without registering
-  // the same ID a second time in openalgo-charts.
-  if (registeredConditions.has(conditionId)) {
-    registeredConditions.set(conditionId, config)
-    return conditionId
+    return terms.some(Boolean)
   }
 
-  const barCondition: BarCondition = {
-    id: conditionId,
-    title: `Advanced Alert (${config.conditions.length} conditions)`,
-    when: (context) => {
-      const active = registeredConditions.get(conditionId)
-      if (!active) return false
-      return evaluateAdvancedAlert(active, context.bars)
-    },
-  }
-
-  registerBarCondition(barCondition)
-  registeredConditions.set(conditionId, config)
-  return conditionId
-}
-
-export function unregisterAdvancedAlertCondition(configId: string): void {
-  const conditionId = `adv_alert_${configId}`
-  registeredConditions.delete(conditionId)
-  unregisterBarCondition(conditionId)
-}
-
-export function getRegisteredAdvancedAlert(configId: string): AdvancedAlertConfig | undefined {
-  return registeredConditions.get(`adv_alert_${configId}`)
-}
-
-export function syncRegisteredAdvancedAlerts(alerts: readonly { payload?: unknown }[]): void {
-  for (const alert of alerts) {
-    const payload = alert.payload as { advancedConfig?: AdvancedAlertConfig } | undefined
-    if (payload?.advancedConfig) {
-      registerAdvancedAlertCondition(payload.advancedConfig)
+    // Single condition
+    if (config.conditions.length === 1) {
+      return evaluateSingleCondition(config.conditions[0]!, baseBars, chartIndicators)
     }
-  }
-}
+
+        // Adjacent rules evaluation with standard AND-before-OR boolean precedence.
+        // Gathers adjacent AND-connected terms, then OR across the terms.
+        // Backward compatibility: If no rule connectors exist, falls back to config.logic ('and' | 'or').
+        const terms: boolean[] = []
+        let currentTerm = evaluateSingleCondition(config.conditions[0]!, baseBars, chartIndicators)
+
+        for (let i = 1; i < config.conditions.length; i++) {
+          const cond = config.conditions[i]!
+          const connector = cond.connector ?? config.connectors?.[i - 1] ?? config.logic ?? 'and'
+          const val = evaluateSingleCondition(cond, baseBars, chartIndicators)
+
+          if (connector === 'and') {
+            currentTerm = currentTerm && val
+          } else {
+            terms.push(currentTerm)
+            currentTerm = val
+          }
+        }
+        terms.push(currentTerm)
+
+        return terms.some(Boolean)
+      }
+
+      /* ── BarCondition Registration for OpenAlgo-Charts ────────────────────────── */
+
+      const registeredConditions = new Map<string, AdvancedAlertConfig>()
+
+      /**
+       * Registers an advanced multi-condition alert into openalgo-charts' BarCondition system.
+       * Returns the condition ID.
+       */
+      export function registerAdvancedAlertCondition(config: AdvancedAlertConfig): string {
+        const conditionId = `adv_alert_${config.id}`
+        // Alert restoration may run more than once (for example during React remounts).
+        // Keep the registered callback and refresh its configuration without registering
+        // the same ID a second time in openalgo-charts.
+        if (registeredConditions.has(conditionId)) {
+          registeredConditions.set(conditionId, config)
+          return conditionId
+        }
+
+        const barCondition: BarCondition = {
+          id: conditionId,
+          title: `Advanced Alert (${config.conditions.length} conditions)`,
+          when: (context) => {
+            const active = registeredConditions.get(conditionId)
+            if (!active) return false
+            return evaluateAdvancedAlert(active, context.bars)
+          },
+        }
+
+        registerBarCondition(barCondition)
+        registeredConditions.set(conditionId, config)
+        return conditionId
+      }
+
+      export function unregisterAdvancedAlertCondition(configId: string): void {
+        const conditionId = `adv_alert_${configId}`
+        registeredConditions.delete(conditionId)
+        unregisterBarCondition(conditionId)
+      }
+
+      export function getRegisteredAdvancedAlert(configId: string): AdvancedAlertConfig | undefined {
+        return registeredConditions.get(`adv_alert_${configId}`)
+      }
+
+      export function syncRegisteredAdvancedAlerts(alerts: readonly { payload?: unknown }[]): void {
+        const activeConditionIds = new Set<string>()
+        for (const alert of alerts) {
+          const payload = alert.payload as { advancedConfig?: AdvancedAlertConfig } | undefined
+          if (payload?.advancedConfig) {
+            const conditionId = registerAdvancedAlertCondition(payload.advancedConfig)
+            activeConditionIds.add(conditionId)
+          }
+        }
+
+        // Clean up any conditions that are no longer part of active alerts
+        for (const [condId, config] of registeredConditions.entries()) {
+          if (!activeConditionIds.has(condId)) {
+            unregisterAdvancedAlertCondition(config.id)
+          }
+        }
+      }

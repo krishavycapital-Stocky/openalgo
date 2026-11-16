@@ -2,9 +2,36 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { io, type Socket } from 'socket.io-client'
 import { toast } from 'sonner'
+import { notifyIfHidden } from '@/lib/trading/alertNotify'
+import {
+  type AlertSoundDuration,
+  type AlertSoundName,
+  alertSoundManager,
+  readyAudioContext,
+} from '@/lib/trading/alertSoundManager'
+import {
+  handleOrderUpdateAlert,
+  type OrderUpdateFrame,
+  orderAlertDeduplicator,
+} from '@/lib/trading/orderAlerts'
 import { type AlertCategories, useAlertStore } from '@/stores/alertStore'
 import { useAuthStore } from '@/stores/authStore'
 import { useSessionStore } from '@/stores/sessionStore'
+
+export interface StrategyAlertFrame {
+  readonly alert_id?: string
+  readonly strategy_id?: string
+  readonly user_id?: string
+  readonly title: string
+  readonly message: string
+  readonly level?: 'info' | 'warning' | 'danger' | 'error' | 'success'
+  readonly sound?: AlertSoundName
+  readonly duration?: AlertSoundDuration
+  readonly symbol?: string
+  readonly exchange?: string
+  readonly price?: number | null
+  readonly timestamp?: number
+}
 
 // Audio throttling configuration
 const AUDIO_THROTTLE_MS = 1000
@@ -255,6 +282,47 @@ export function useSocket() {
       }
     )
 
+    // Broker order status updates (fills, partial fills, rejections, cancellations)
+    socket.on('order_update', (frame: OrderUpdateFrame) => {
+      handleOrderUpdateAlert(frame)
+    })
+
+    // Strategy alerts (algorithmic signals, Python strategies, backend alerts)
+    socket.on('strategy_alert', (data: StrategyAlertFrame) => {
+      if (!data || !data.title) return
+
+      const level = data.level === 'error' ? 'danger' : data.level || 'info'
+      const toastType: 'success' | 'error' | 'warning' | 'info' =
+        level === 'danger'
+          ? 'error'
+          : level === 'warning'
+            ? 'warning'
+            : level === 'success'
+              ? 'success'
+              : 'info'
+
+      const toastMessage = data.message ? `${data.title}: ${data.message}` : data.title
+      showCategoryToast(toastType, toastMessage, 'pythonStrategy')
+
+      const alertId = data.alert_id || `strat-${Date.now()}`
+
+      if (data.sound) {
+        readyAudioContext()
+        alertSoundManager.trigger({
+          id: alertId,
+          title: data.title,
+          soundName: data.sound,
+          duration: data.duration || 'once',
+        })
+      }
+
+      notifyIfHidden({
+        title: data.title,
+        body: data.message || '',
+        tag: `strat-${alertId}`,
+      })
+    })
+
     // Active sessions update (event-driven, no polling)
     socket.on('active_sessions_update', (data: { count: number }) => {
       useSessionStore.getState().setActiveSessionCount(data.count)
@@ -331,6 +399,7 @@ export function useSocket() {
     })
 
     return () => {
+      orderAlertDeduplicator.reset()
       socket.disconnect()
       setSocketInstance(null)
       ;['click', 'touchstart', 'keydown'].forEach((eventType) => {

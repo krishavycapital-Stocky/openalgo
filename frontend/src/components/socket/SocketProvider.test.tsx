@@ -142,6 +142,7 @@ const PROVIDER_EVENTS = [
   'modify_order_event',
   'close_position_event',
   'order_notification',
+  'order_update',
   'active_sessions_update',
   'analyzer_update',
 ]
@@ -502,6 +503,28 @@ describe('Historify on the shared connection', () => {
 
     expect(toasts.success).toHaveBeenCalledTimes(1)
     expect(toasts.success).toHaveBeenCalledWith('BUY Order Placed for Symbol: SBIN, Order ID: 42')
+  })
+
+  it('delivers broker order status alerts from order_update socket frames', async () => {
+    renderHistorify()
+    const socket = onlySocket()
+
+    act(() => {
+      socket.fire('order_update', {
+        orderid: 'ORD-BROKER-1',
+        symbol: 'TCS',
+        action: 'BUY',
+        quantity: 10,
+        filled_quantity: 10,
+        average_price: 4100,
+        order_status: 'complete',
+        exchange: 'NSE',
+      })
+    })
+
+    expect(toasts.success).toHaveBeenCalledWith(
+      expect.stringContaining('BUY 10 TCS filled @ ₹4,100.00 on NSE')
+    )
   })
 
   it('still reports a cancelled download job', async () => {

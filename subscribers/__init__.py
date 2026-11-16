@@ -127,4 +127,11 @@ def register_all():
     # receives it on its own (subscribers/alert_subscriber.py).
     alert_subscriber.register()
 
+    # --- alerts: Strategy & algorithmic signals ---
+    bus.subscribe(
+        "alert.strategy",
+        socketio_subscriber.on_strategy_alert,
+        "socketio:strategy_alert",
+    )
+
     logger.debug("EventBus: all subscribers registered")

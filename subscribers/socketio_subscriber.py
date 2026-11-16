@@ -267,6 +267,27 @@ def on_order_update(event):
     )
 
 
+def on_strategy_alert(event):
+    """Emit strategy_alert for algorithmic signals, Python strategies, and backend evaluations."""
+    socketio.emit(
+        "strategy_alert",
+        {
+            "alert_id": getattr(event, "alert_id", ""),
+            "strategy_id": getattr(event, "strategy_id", ""),
+            "user_id": getattr(event, "user_id", ""),
+            "title": getattr(event, "title", ""),
+            "message": getattr(event, "message", ""),
+            "level": getattr(event, "level", "info"),
+            "sound": getattr(event, "sound", "chime"),
+            "duration": getattr(event, "duration", "once"),
+            "symbol": getattr(event, "symbol", ""),
+            "exchange": getattr(event, "exchange", ""),
+            "price": getattr(event, "price", None),
+            "timestamp": getattr(event, "timestamp", 0.0),
+        },
+    )
+
+
 def _emit_analyzer_update(event):
     """Helper to emit the analyzer_update socketio event."""
     socketio.emit(

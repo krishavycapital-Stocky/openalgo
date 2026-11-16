@@ -61,6 +61,7 @@ from .ticker import api as ticker_ns
 from .tradebook import api as tradebook_ns
 from .webhook_alerts import discord_ns, slack_ns
 from .whatsapp_bot import api as whatsapp_ns
+from .strategy_alert import api as strategy_alert_ns
 
 # Add namespaces
 api.add_namespace(place_order_ns, path="/placeorder")
@@ -114,3 +115,5 @@ api.add_namespace(modify_gtt_order_ns, path="/modifygttorder")
 api.add_namespace(cancel_gtt_order_ns, path="/cancelgttorder")
 api.add_namespace(gtt_orderbook_ns, path="/gttorderbook")
 api.add_namespace(strategy_ns, path="/strategy")
+api.add_namespace(strategy_alert_ns, path="/strategy/alert")
+api.add_namespace(strategy_alert_ns, path="/alerts/notify")

@@ -1,11 +1,13 @@
 """The event every alert channel listens to."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from events.base import OrderEvent
+from utils.event_bus import Event
 
 #: The topic alerts are published on.
 ALERT_TOPIC = "alert.raised"
+STRATEGY_ALERT_TOPIC = "alert.strategy"
 
 
 @dataclass
@@ -32,3 +34,25 @@ class AlertRaisedEvent(OrderEvent):
     topic: str = ALERT_TOPIC
     category: str = ""
     source_topic: str = ""
+
+
+@dataclass
+class StrategyAlertEvent(Event):
+    """An alert raised by a Python strategy, external signal, or backend evaluation."""
+
+    topic: str = STRATEGY_ALERT_TOPIC
+    alert_id: str = ""
+    strategy_id: str = ""
+    user_id: str = ""
+    title: str = ""
+    message: str = ""
+    level: str = "info"  # "info", "warning", "danger", "success"
+    sound: str = "chime"
+    duration: str = "once"
+    symbol: str = ""
+    exchange: str = ""
+    price: float | None = None
+    channels: list[str] = field(default_factory=lambda: ["browser", "sound"])
+    timestamp: float = 0.0
+    delivered: list[str] = field(default_factory=list)
+

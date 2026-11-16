@@ -42,6 +42,7 @@ import {
 } from '@/components/ui/select'
 import { readySound } from '@/lib/trading/alertDelivery'
 import { ALERT_PLACEHOLDERS } from '@/lib/trading/alertMessage'
+import type { AlertPatch } from 'openalgo-charts'
 import { askToNotify } from '@/lib/trading/alertNotify'
 import {
   ALERT_DURATION_OPTIONS,
@@ -164,6 +165,8 @@ export function AlertsDialog({ handle, onClose }: Props) {
         chart: handle.chart,
         drawings: handle.drawings,
         zone,
+        exchange: handle.exchange,
+        instrumentInfo: handle.instrumentInfo,
         ...(handle.source ? { source: handle.source } : {}),
         ...(existing ? { existing } : {}),
         ...(handle.at ? { at: handle.at } : {}),
@@ -190,16 +193,30 @@ export function AlertsDialog({ handle, onClose }: Props) {
 
   const save = () => {
     if (!handle || draft === null) return
-    const fault = draftProblem(draft, handle.chart, handle.drawings)
+    const fault = draftProblem(draft, handle.chart, handle.drawings, handle.symbol)
     if (fault !== null) {
       setProblem(fault)
       return
     }
-    const input = toAlertInput(draft, handle.chart, handle.drawings, handle.symbol, handle.at)
+    const input = toAlertInput(
+      draft,
+      handle.chart,
+      handle.drawings,
+      handle.symbol,
+      handle.at,
+      handle.interval,
+      handle.exchange
+    )
     if (input === null) return
     try {
-      if (editing) handle.alerts.update(editing, input)
-      else handle.alerts.add(input)
+      if (editing) {
+        handle.alerts.update(editing, input as AlertPatch)
+      } else {
+        const created = handle.alerts.add(input)
+        if (input.scope && created?.id) {
+          handle.alerts.update(created.id, { scope: input.scope } as AlertPatch)
+        }
+      }
       // Asked here and nowhere else. This is a click the trader has just made
       // for the express purpose of being told about a price, which is the one
       // moment a request to notify them explains itself; on page load it is a
@@ -276,8 +293,12 @@ export function AlertsDialog({ handle, onClose }: Props) {
                 <MultiConditionEditor
                   conditions={draft.advancedConditions ?? []}
                   logic={draft.advancedLogic ?? 'and'}
-                  onChange={(advancedConditions, advancedLogic) =>
-                    patch({ advancedConditions, advancedLogic })
+                  groups={draft.advancedGroups}
+                  symbol={handle?.symbol}
+                  exchange={handle?.exchange}
+                  instrumentInfo={handle?.instrumentInfo}
+                  onChange={(advancedConditions, advancedLogic, advancedGroups) =>
+                    patch({ advancedConditions, advancedLogic, advancedGroups })
                   }
                 />
               ) : (

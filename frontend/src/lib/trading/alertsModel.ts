@@ -20,17 +20,21 @@
 import {
   type Alert,
   type AlertInput,
+  type AlertScope,
   type AlertSource,
   utcSecondsToZonedParts,
   zonedWallClockToUtcSeconds,
 } from 'openalgo-charts'
 import {
   type AdvancedAlertConfig,
+  type ConditionGroupConfig,
   registerAdvancedAlertCondition,
   type SingleAlertCondition,
+  timeframeToSeconds,
 } from './advancedAlerts'
 import { type AlertDelivery, DEFAULT_DELIVERY, deliveryOf } from './alertDelivery'
 import { snapTick } from './format'
+import { openInterestCapability, parseContractDetails, volumeCapability } from './openInterest'
 
 /**
  * The instrument's tick, and a price to sanity-check it against.
@@ -75,6 +79,8 @@ export interface AlertChart {
   }[]
   primaryBars(): readonly { close: number }[]
   timezone(): string
+  interval?(): string
+  getDataContext?(): { symbol?: string; exchange?: string; interval?: string }
 }
 
 /** The drawing tier, when it is loaded. Alerts on drawings are optional. */
@@ -131,6 +137,9 @@ export interface AlertDraft {
   /** TradingView-style multi-condition rules (Priority 2). */
   advancedConditions?: SingleAlertCondition[]
   advancedLogic?: 'and' | 'or'
+  advancedGroups?: ConditionGroupConfig[]
+  exchange?: string
+  instrumentInfo?: Record<string, unknown>
 }
 
 /**
@@ -242,8 +251,16 @@ export function lastClose(chart: AlertChart): number | null {
 export function draftProblem(
   draft: AlertDraft,
   chart: AlertChart,
-  drawings: AlertDrawings | null
+  drawings: AlertDrawings | null,
+  symbol?: string
 ): string | null {
+  if (draft.exchange && symbol) {
+    const details = parseContractDetails(symbol, draft.exchange, draft.instrumentInfo)
+    if (details.isExpired && details.expiry) {
+      return `Contract ${symbol} has expired on ${details.expiry}. Cannot arm alerts on an expired contract.`
+    }
+  }
+
   if (needsThreshold(draft.kind)) {
     const value = Number(draft.value)
     if (draft.value.trim() === '' || !Number.isFinite(value)) {
@@ -277,8 +294,39 @@ export function draftProblem(
     if (draft.advancedConditions.length > 5) {
       return 'An alert supports up to 5 conditions.'
     }
+    if (draft.advancedGroups && draft.advancedGroups.length > 1) {
+      if (draft.advancedGroups.length > 5) {
+        return 'Multi-condition alerts support up to 5 groups.'
+      }
+      for (let g = 0; g < draft.advancedGroups.length; g++) {
+        const grp = draft.advancedGroups[g]!
+        const assigned = draft.advancedConditions.filter(
+          (c) => (c.groupId || draft.advancedGroups![0]!.id) === grp.id
+        )
+        if (assigned.length === 0) {
+          return `${grp.name || `Group ${g + 1}`} has no conditions assigned. Assign at least one condition or remove the group.`
+        }
+      }
+    }
     for (let i = 0; i < draft.advancedConditions.length; i++) {
       const c = draft.advancedConditions[i]!
+
+      // Instrument capability validation
+      const ex = draft.exchange || ''
+      const info = draft.instrumentInfo || {}
+
+      if (c.left.type === 'volume' || c.right.type === 'volume') {
+        if (ex && volumeCapability(ex, info) === false) {
+          return `Condition #${i + 1}: Volume is not available on index instruments (${ex}).`
+        }
+      }
+
+      if (c.left.type === 'openInterest' || c.right.type === 'openInterest') {
+        if (ex && openInterestCapability(ex, info) === false) {
+          return `Condition #${i + 1}: Open Interest is only available on derivative contracts (Futures & Options), not cash instruments (${ex}).`
+        }
+      }
+
       if (c.left.type === 'indicator' && !c.left.indicator) {
         return `Condition #${i + 1}: Select an indicator on the left.`
       }
@@ -370,8 +418,15 @@ export function titleFor(
 ): string {
   if (draft.kind === 'advanced') {
     const count = draft.advancedConditions?.length ?? 0
+    const groupCount = draft.advancedGroups?.length ?? 0
+    const isGrouped = groupCount > 1
     const logic = (draft.advancedLogic ?? 'and').toUpperCase()
-    return `${symbol} Multi-Condition (${count} condition${count === 1 ? '' : 's'}, ${logic})`
+    const desc = isGrouped
+      ? groupCount === 2
+        ? `Grouped ${logic}`
+        : `${groupCount} Groups`
+      : logic
+    return `${symbol} Multi-Condition (${count} condition${count === 1 ? '' : 's'}, ${desc})`
   }
   return nameFrom(
     {
@@ -512,8 +567,10 @@ export function draftFor(options: {
   readonly source?: AlertSource
   readonly existing?: Alert
   readonly at?: AlertTick
+  readonly exchange?: string
+  readonly instrumentInfo?: Record<string, unknown>
 }): AlertDraft {
-  const { chart, drawings: tier, zone, existing, at } = options
+  const { chart, drawings: tier, zone, existing, at, exchange, instrumentInfo } = options
   const existingPayload = existing?.payload as AlertPayload | undefined
   const isAdvanced = existingPayload?.advancedConfig !== undefined
   const source = existing?.source ?? options.source
@@ -577,6 +634,8 @@ export function draftFor(options: {
     // An alert stored before delivery was a choice reads as the default, which
     // is the behaviour it already had plus the sound.
     deliver: deliveryOf(existing?.payload),
+    exchange,
+    instrumentInfo,
     advancedConditions:
       isAdvanced && existingPayload?.advancedConfig?.conditions
         ? [...existingPayload.advancedConfig.conditions]
@@ -593,7 +652,58 @@ export function draftFor(options: {
             },
           ],
     advancedLogic: isAdvanced ? (existingPayload?.advancedConfig?.logic ?? 'and') : 'and',
+    advancedGroups:
+      isAdvanced && existingPayload?.advancedConfig?.groups
+        ? [...existingPayload.advancedConfig.groups]
+        : undefined,
   }
+}
+
+/**
+ * Resolves the target evaluation interval for an alert.
+ * For advanced multi-condition alerts, inspects explicit rule timeframes:
+ * - If all explicit rules use the same interval (e.g. '1m'), returns that interval.
+ * - If rules use 'chart', falls back to the active chart interval.
+ * - If mixed timeframes (e.g. 1m and 5m), uses the minimum timeframe required to evaluate the fastest rule.
+ */
+export function resolveAlertInterval(
+  draft: AlertDraft,
+  chartInterval?: string
+): string {
+  const fallback = chartInterval || '1m'
+  if (draft.kind !== 'advanced' || !draft.advancedConditions || draft.advancedConditions.length === 0) {
+    return fallback
+  }
+
+  const explicitTfs = draft.advancedConditions
+    .map((c) => c.timeframe)
+    .filter((tf): tf is string => Boolean(tf && tf !== 'chart'))
+
+  if (explicitTfs.length === 0) {
+    return fallback
+  }
+
+  // If all explicit rules target the same interval (e.g. both '1m'), that is the exact target
+  const allSame = explicitTfs.every((tf) => tf === explicitTfs[0])
+  if (allSame) {
+    return explicitTfs[0]
+  }
+
+  // Mixed timeframes: find minimum duration in seconds
+  const tfSeconds = explicitTfs.map((tf) => ({ tf, sec: timeframeToSeconds(tf) }))
+  tfSeconds.sort((a, b) => a.sec - b.sec)
+  const minRule = tfSeconds[0]
+
+  const chartSec = chartInterval ? timeframeToSeconds(chartInterval) : 0
+  if (chartSec > 0 && chartSec <= minRule.sec) {
+    return chartInterval!
+  }
+
+  return minRule.tf
+}
+
+export interface AppAlertInput extends AlertInput {
+  scope?: AlertScope
 }
 
 /**
@@ -608,17 +718,50 @@ export function toAlertInput(
   chart: AlertChart,
   drawings: AlertDrawings | null,
   symbol: string,
-  at?: AlertTick
-): AlertInput | null {
-  if (draftProblem(draft, chart, drawings) !== null) return null
+  at?: AlertTick,
+  chartInterval?: string,
+  exchange?: string
+): AppAlertInput | null {
+  if (draftProblem(draft, chart, drawings, symbol) !== null) return null
   const cooldown = Number(draft.cooldownSeconds)
+  const activeInterval =
+    chartInterval ||
+    (typeof (chart as { interval?: () => string }).interval === 'function'
+      ? (chart as { interval: () => string }).interval()
+      : undefined) ||
+    (typeof (chart as { getDataContext?: () => { interval?: string } }).getDataContext === 'function'
+      ? (chart as { getDataContext: () => { interval?: string } }).getDataContext()?.interval
+      : undefined) ||
+    '1m'
+  const activeExchange =
+    exchange ||
+    draft.exchange ||
+    (typeof (chart as { getDataContext?: () => { exchange?: string } }).getDataContext === 'function'
+      ? (chart as { getDataContext: () => { exchange?: string } }).getDataContext()?.exchange
+      : undefined) ||
+    ''
 
   if (draft.kind === 'advanced') {
-    const configId = `adv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+    const targetInterval = resolveAlertInterval(draft, activeInterval)
+    const existingConfigId = draft.barConditionId?.startsWith('adv_alert_')
+      ? draft.barConditionId.replace('adv_alert_', '')
+      : undefined
+    const configId =
+      existingConfigId ?? `adv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
     const config: AdvancedAlertConfig = {
       id: configId,
       logic: draft.advancedLogic ?? 'and',
       conditions: draft.advancedConditions ?? [],
+      ...(draft.advancedConditions && draft.advancedConditions.length > 1
+        ? {
+            connectors: draft.advancedConditions
+              .slice(1)
+              .map((c) => c.connector ?? draft.advancedLogic ?? 'and'),
+          }
+        : {}),
+      ...(draft.advancedGroups && draft.advancedGroups.length > 0
+        ? { groups: draft.advancedGroups }
+        : {}),
       triggerMode: draft.repeat === 'once' ? 'once' : 'everyTime',
       cooldownSeconds: !Number.isFinite(cooldown) || cooldown < 0 ? 0 : cooldown,
     }
@@ -630,6 +773,11 @@ export function toAlertInput(
       repeat: draft.repeat,
       state: draft.enabled ? 'armed' : 'disabled',
       title: draft.title.trim() || titleFor(draft, chart, symbol, at),
+      scope: {
+        symbol,
+        exchange: activeExchange,
+        interval: targetInterval,
+      },
       payload: {
         ...(draft.title.trim() === '' ? AUTO_TITLE_PAYLOAD : {}),
         deliver: draft.deliver ?? DEFAULT_DELIVERY,
@@ -667,6 +815,11 @@ export function toAlertInput(
     repeat: draft.repeat,
     state: draft.enabled ? 'armed' : 'disabled',
     title: draft.title.trim() || titleFor(draft, chart, symbol, at),
+    scope: {
+      symbol,
+      exchange: activeExchange,
+      interval: activeInterval,
+    },
     // Marked when we named it, so a drag can rename it and a name the trader
     // typed is left exactly as they typed it.
     payload: {
